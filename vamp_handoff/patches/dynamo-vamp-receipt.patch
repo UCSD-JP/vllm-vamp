@@ -1,0 +1,73 @@
+--- a/components/backends/vllm/src/dynamo/vllm/handlers.py
++++ b/components/backends/vllm/src/dynamo/vllm/handlers.py
+@@ -35,6 +35,9 @@
+         self.default_sampling_params = default_sampling_params
+         self.kv_publisher = None
+         self.engine_monitor = VllmEngineMonitor(runtime, engine)
++        # VAMP receipt: stable worker identity for target verification.
++        # Set VAMP_WORKER_ID per worker process (e.g. w0/w1); unset -> no tag.
++        self.vamp_worker_id = os.environ.get("VAMP_WORKER_ID") or None
+ 
+     @abstractmethod
+     async def generate(self, request, context) -> AsyncGenerator[dict, None]:
+@@ -51,6 +54,20 @@
+         """Override in subclasses if cleanup is needed."""
+         pass
+ 
++    def _vamp_tag(self, out):
++        if self.vamp_worker_id is not None:
++            out["worker_id"] = self.vamp_worker_id
++        return out
++
++    def _vamp_wrong_worker(self, request):
++        """VAMP exact targeting: a request that names a target worker must
++        not run elsewhere (spec: wrong-worker execution is an immediate stop).
++        Returns the target id when this worker is not it, else None."""
++        target = request.get("vamp_target_worker") if isinstance(request, dict) else None
++        if target and self.vamp_worker_id and target != self.vamp_worker_id:
++            return target
++        return None
++
+     async def generate_tokens(self, prompt, sampling_params, request_id):
+         try:
+             gen = self.engine_client.generate(prompt, sampling_params, request_id)
+@@ -63,16 +80,18 @@
+                     # This is the expected way for a request to end.
+                     # The new token ID will be eos, don't forward it.
+                     if res.finished:
+-                        yield {"finish_reason": "stop", "token_ids": []}
++                        yield self._vamp_tag({"finish_reason": "stop", "token_ids": []})
+                         break
+ 
+                     if not res.outputs:
+-                        yield {"finish_reason": "error", "token_ids": []}
++                        yield self._vamp_tag({"finish_reason": "error", "token_ids": []})
+                         break
+ 
+                     output = res.outputs[0]
+                     next_total_toks = len(output.token_ids)
+-                    out = {"token_ids": output.token_ids[num_output_tokens_so_far:]}
++                    out = self._vamp_tag(
++                        {"token_ids": output.token_ids[num_output_tokens_so_far:]}
++                    )
+                     if output.finish_reason:
+                         out["finish_reason"] = output.finish_reason
+                     if output.stop_reason:
+@@ -136,6 +155,17 @@
+         request_id = str(uuid.uuid4().hex)
+         logger.debug(f"New Request ID: {request_id}")
+ 
++        wrong = self._vamp_wrong_worker(request)
++        if wrong is not None:
++            logger.error(
++                f"VAMP wrong worker: request targeted {wrong} but reached "
++                f"{self.vamp_worker_id}; refusing to generate"
++            )
++            yield self._vamp_tag(
++                {"finish_reason": "error", "token_ids": [], "vamp_error": "wrong_worker"}
++            )
++            return
++
+         prompt = TokensPrompt(prompt_token_ids=request["token_ids"])
+ 
+         sampling_params = SamplingParams(**self.default_sampling_params)

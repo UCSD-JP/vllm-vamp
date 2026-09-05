@@ -242,10 +242,13 @@ class SessionReplayRunner:
         receipt = self.backend.submit(req, destination)
         trace.dispatch_ns = self.clock.now_ns()
         trace.actual_worker = receipt.actual_worker
-        trace.target_verified = receipt.target_verified
         trace.status = "in_flight"
-        if not receipt.target_verified:
-            self.invalid_target.append(key)
+        if receipt.actual_worker in (None, "unknown"):
+            trace.target_verified = None  # decided by the stream receipt
+        else:
+            trace.target_verified = receipt.target_verified
+            if not receipt.target_verified:
+                self.invalid_target.append(key)
         st.in_flight = key
         self.outstanding += 1
         self.trace.write(
@@ -300,12 +303,18 @@ class SessionReplayRunner:
         if chunk.worker_id and trace.actual_worker in (None, "unknown"):
             trace.actual_worker = chunk.worker_id
             trace.target_verified = chunk.worker_id == trace.designated_worker
+            if not trace.target_verified:
+                self.invalid_target.append(key)
 
     def _finish(self, key: RequestKey, now_ns: int) -> None:
         trace = self.traces[key]
         if trace.response_done_ns is not None:
             return
         trace.response_done_ns = now_ns
+        if trace.target_verified is None:
+            # no receipt ever arrived: never assume the target was honoured
+            trace.target_verified = False
+            self.invalid_target.append(key)
         session = self.manifest.sessions[key.session_id]
         turn = session.turns[key.turn_id]
         trace.marker_ok = turn.expected_marker in trace.output_text

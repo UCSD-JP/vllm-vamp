@@ -35,9 +35,40 @@
 4. **destination import**: 외부 payload를 destination worker CPU tensor의 새로 할당된 block에 쓰고 manager에 `prepare_store`/`complete_store`로 등록하는 경로. 기존 CPU→GPU handler가 이후 복원을 담당한다.
 5. **routing receipt**: 응답 헤더 또는 첫 chunk에 실제 worker id를 실어 runner의 target 검증에 쓴다.
 
-각 변경은 별도 patch로 전달하고 rollback 방법을 함께 적는다. 이 commit은 위 변경을 포함하지 않는다.
+각 변경은 별도 patch로 전달하고 rollback 방법을 함께 적는다. 1~4는 vLLM 소스를
+바꾸지 않고 `vamp_cxl/vllm_binding.py`에서 `spec_module_path` 확장점으로 구현했다
+(아래 표). 5는 `patches/dynamo-vamp-receipt.patch`로 제공하며 설치본에는 적용하지
+않았다. rollback: extra_config에서 `spec_module_path`/`spec_name`을 제거하면 기존
+`CPUOffloadingSpec`으로 돌아가고, patch는 `patch -R -p1`로 되돌린다.
 
 ## Fake backend와의 대응
 
 `vamp_cxl` fake는 위 9개 항목을 모두 SUPPORTED로 보고하되 `is_mock=True`,
 `backend="fake"`로 표시한다. mock 통과는 hardware capability 통과가 아니다.
+
+## 이 branch에서 구현한 것 (2026-09-05, GPU 없이 구현·검증 범위 구분)
+
+"검증 불가"와 "구현 불가"를 구분한다. 아래는 하드웨어 없이 *구현*했고,
+각 항목의 검증 수준을 명시한다. 어느 것도 provider 코드나 vLLM 소스를 바꾸지
+않았다(`verify_source_lock.py` PASS).
+
+| 항목 | 구현 위치 | GPU-free 검증 수준 | 남은 실장비 검증 |
+| --- | --- | --- | --- |
+| CPU READY / eviction 통지 | `vamp_cxl/vllm_binding.py` `VampCPUOffloadingManager.complete_store/prepare_store` | 실제 v0.19.0 `CPUOffloadingManager`에 대해 CPU-only 단위 테스트 (`tests/test_vllm_binding.py`) | scheduler process에 listener 등록 후 finished_sending 타이밍 관측 (G-A) |
+| export lease (원자적 READY 확인+pin) | 같은 파일 `acquire_export_lease` / `release_export_lease`; 다른 thread는 mailbox(`*_async`) 사용, `lookup`/`take_events`에서 drain | 실제 manager로 partial-pin 거부, pinned block eviction 면제, foreign thread 거부, mailbox drain 검증 | scheduler thread 안에서 drain 지연이 lookup latency에 주는 영향 (G-B) |
+| destination import | `reserve_import` / `commit_import` (prepare_store/complete_store 재사용) | 실제 manager로 예약→미READY→commit→READY, 실패 시 제거 검증 | worker 측 tensor 쓰기와 scheduler 측 commit의 순서 (G-D) |
+| CPU payload export/import bridge | `CpuPayloadBridge` (worker 측, zero-copy memoryview) | CPU int8 tensor로 gather/import/checksum 왕복 검증 | CUDA pinned tensor에서 동일 동작, handler와의 stream ordering (G-D) |
+| spec_module_path 접합 | `VampOffloadingSpec` (`spec_name`/`spec_module_path` extra_config) | import 및 클래스 구조만 확인; engine 기동 없음 | 실제 engine 기동과 handler 등록 (G-A) |
+| B1 network transport (correctness prototype) | `vamp_cxl/network_transport.py` TCP chunk framing, per-chunk checksum, chunk 경계 cancel, terminal event 1개 | loopback 1 MiB 왕복, cancel/failure/queued-cancel, executor 결합 (`tests/test_network_transport.py`) | host 간 대역폭 측정은 calibration probe에서 별도; NIXL 등 지원 transport 조사는 미완 |
+| 정확한 target worker receipt | `patches/dynamo-vamp-receipt.patch` (`handlers.py`에 `worker_id` 태그, `vamp_target_worker` 불일치 시 생성 거부) | pristine reference에 `patch -p1` 적용·구문 검사 (`tests/test_dynamo_patch.py`) | 실제 Dynamo 설치본 적용, frontend가 `vamp_target_worker`를 전달하는 경로 확인 (G-C) |
+| HTTP streaming replay backend | `session_replay.HttpStreamingBackend` | 로컬 SSE 서버로 role/reasoning/content/usage 분류, receipt 검증, misroute 표시 (`tests/test_http_backend.py`) | 실제 Dynamo frontend 헤더/응답 형식 |
+| fixed-API shared store | `vamp_cxl/cxl_shm_binding.py` `CxlSharedKVStore`: 우리 metadata record, 단일 writer, reader lease, generation, destroy→shfree 순서 | EMULATED provider(in-process bytearray)로 lifecycle/ABA/capacity/bounds 검증 (`tests/test_cxl_shm_binding.py`). emulated 통과는 G-E/G-F가 아님 | ABI 확인 후 실제 library, offset origin, lock handle ABI, 실제 CXL write (G-E) |
+| ctypes 바인딩 | `CtypesProviderApi`: `CXL_SHM_LIBRARY`에서만 로드, 확인된 signature digest만 바인딩, lock 계열은 미바인딩 | 미확인 signature 호출 거부, 라이브러리 hash 불일치 거부 검증 | 운영자의 `AbiConfirmation` 작성 |
+| CXL chunk copy transport | `CxlCopyTransport`: chunk 경계 cancel, fence callable 없으면 VISIBLE 미발생(fail closed) | emulated write/read/failure 검증 | visibility primitive 확인 전에는 READY 도달 불가 (BLOCKED 유지) |
+
+여전히 BLOCKED (구현으로 해결 불가, provider/운영자 확인 필요):
+
+- shared offset origin (slice-relative vs device). `OffsetMapper`는 확인 전 device offset 계산을 거부한다.
+- cross-host visibility/fence primitive. `CxlCopyTransport`는 fence가 주입되지 않으면 VISIBLE을 내지 않는다.
+- crash recovery/fencing: 죽은 writer의 RESERVED/WRITING slot 회수 절차 미구현. 임의 timeout 회수는 하지 않는다(spec §6.8).
+- lock handle ABI: 값 전달 handle의 정확한 struct 크기/정렬 미확인. 확인 전에는 `CxlSharedKVStore`를 실제 library에 붙일 수 없다.

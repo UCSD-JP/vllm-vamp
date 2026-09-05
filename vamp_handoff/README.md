@@ -121,13 +121,28 @@ reference 51개의 hash는 변경하지 않았습니다(`verify_source_lock.py` 
 | `vamp_cxl/summarize_migration_run.py` | trace join, baseline/fallback 구분, capacity/latency 보고 |
 | `configs/*.json` | frozen workload/policy/executor/capacity, mock calibration(라벨 `mock`) |
 | `tests/test_offload_mock.py` | M1-M12, 숫자 워크스루, cell smoke, config 고정 검사 |
+| `vamp_cxl/vllm_binding.py` | 실제 vLLM v0.19.0 hook 접합: READY/eviction 통지, export lease(mailbox), import 예약, CPU payload bridge, `VampOffloadingSpec` |
+| `vamp_cxl/network_transport.py` | B1 host-to-host TCP payload transport (correctness prototype) |
+| `vamp_cxl/cxl_shm_binding.py` | 고정 외부 API 위의 shared store, ctypes 바인딩(확인된 signature만), chunk copy transport, EMULATED provider |
+| `patches/dynamo-vamp-receipt.patch` | Dynamo `handlers.py`에 worker receipt와 wrong-worker 거부 추가 (미적용 patch) |
+| `tests/test_vllm_binding.py` | 실제 `CPUOffloadingManager`에 대한 CPU-only 테스트 (torch 없으면 skip) |
+| `tests/test_network_transport.py`, `test_http_backend.py`, `test_cxl_shm_binding.py`, `test_dynamo_patch.py` | loopback socket, 로컬 SSE 서버, emulated provider, patch 적용 검사 |
 
 실행:
 
 ```bash
+# stdlib only (vLLM binding 테스트 5개는 skip)
 .venv/bin/python -S -m unittest discover -s vamp_handoff/tests -v
 cd vamp_handoff && ../.venv/bin/python -S -m vamp_cxl.simulation --sessions 32 --seed 0
+
+# vLLM scheduler-side binding까지 실행: torch + requirements/common.txt 설치 후 -S 없이
+# (GPU wheel/빌드 불필요; CPU-only import로 CPUOffloadingManager를 실제로 구동)
+uv pip install --python .venv/bin/python torch
+uv pip install --python .venv/bin/python -r requirements/common.txt
+.venv/bin/python -m unittest discover -s vamp_handoff/tests -v
 ```
+
+구현/검증 구분 표는 [docs/capability-audit.md](docs/capability-audit.md) 하단에 있습니다.
 
 ### M1-M12 상태
 
@@ -149,12 +164,23 @@ cd vamp_handoff && ../.venv/bin/python -S -m vamp_cxl.simulation --sessions 32 -
 Mock 통과는 hardware capability 통과가 아닙니다. 32-session STAY/MOVE_GAP cell은
 fake 시계로 실행되며 latency는 sequencing용 상수입니다.
 
-### 아직 하지 않은 것
+### 구현했지만 실장비 검증이 남은 것
 
-- 실제 vLLM hook 접합(B0 경로 포함)과 Dynamo patch: `docs/capability-audit.md`의
-  최소 변경 5개는 제안이며 이 branch에 적용하지 않았습니다. `SOURCE_LOCK.json`의
-  `new_cxl_runtime_implemented`는 계속 `false`입니다.
+- vLLM 접합(`vllm_binding.py`)은 vLLM 소스를 바꾸지 않고 `spec_module_path`로
+  끼웁니다. scheduler 측은 실제 manager로 검증했고, worker 측 handler와 engine
+  기동은 G-A에서 확인합니다. `SOURCE_LOCK.json`의 `new_cxl_runtime_implemented`는
+  실제 CXL 접근이 없으므로 계속 `false`입니다.
+- Dynamo patch는 pristine reference에 적용·구문 검사만 했습니다. 설치본 적용은
+  Codex가 backup/rollback과 함께 수행합니다.
+- `CxlSharedKVStore`는 EMULATED provider로만 검증했습니다. 실제 library는 운영자의
+  ABI 확인(`AbiConfirmation`) 전에는 로드/호출되지 않습니다.
+
+### 아직 하지 않은 것 / 할 수 없는 것
+
 - G-A ~ G-H 실장비 gate, 실제 calibration, MOVE_IMMEDIATE/MOVE_CONTENDED 부하.
-- `HttpStreamingBackend`는 실장비용 골격이며 GPU-free 테스트에서 실행하지 않았습니다.
+- provider 확인이 필요한 항목: offset origin, visibility/fence primitive, lock
+  handle ABI, crash recovery. 코드는 확인 전 fail closed로 동작합니다.
+- scheduler↔worker 간 RPC(export lease 요청을 worker bridge로 전달하는 경로)는
+  in-process mailbox까지만 있고 프로세스 간 전달은 미구현입니다.
 - 균일 8K trace에서 P_VALUE는 mock calibration으로 전부 STORE_NOW를 냅니다.
   명세대로 정상 결과이며 계수를 바꾸지 않았습니다.

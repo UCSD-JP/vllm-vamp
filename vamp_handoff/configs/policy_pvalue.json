@@ -1,0 +1,9 @@
+{
+  "_note": "Frozen P_VALUE / P_DELAY coefficients (spec §7). remote_reuse_weight is a sensitivity coefficient, not a calibrated probability. Do not tune after seeing cell results.",
+  "defer_budget_ms": 5000,
+  "stale_snapshot_ms": 1000,
+  "timer_ms": 100,
+  "remote_reuse_weight": 0.5,
+  "margin": 0.10,
+  "wait_budget_ms_on_demand": 0
+}

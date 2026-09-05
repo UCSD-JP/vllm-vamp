@@ -1,0 +1,7 @@
+{
+  "_note": "Common transfer executor (spec §7). Demand reads are scheduled before background writes in every arm. Chunk = one engine offload block (32 tokens x 160 KiB). Staging budget applies per host to every arm's staged path.",
+  "max_inflight_publications_per_source": 1,
+  "max_inflight_publications": 2,
+  "chunk_bytes": 5242880,
+  "staging_budget_bytes": 67108864
+}

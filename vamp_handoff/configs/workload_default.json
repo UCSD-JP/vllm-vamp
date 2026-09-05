@@ -1,0 +1,31 @@
+{
+  "_note": "Frozen first-campaign workload (spec §3). Token counts are targets; the manifest measures them with the real tokenizer/template on hardware runs.",
+  "model": "Qwen/Qwen3-14B",
+  "model_revision": "unpinned",
+  "tokenizer_revision": "unpinned",
+  "sessions": 32,
+  "turns_per_session": 4,
+  "reusable_prefix_tokens": 8192,
+  "max_output_tokens": 32,
+  "max_outstanding_requests": 8,
+  "workers": ["w0", "w1"],
+  "max_model_len": 16384,
+  "offload_block_tokens": 32,
+  "migration_turn": 2,
+  "migrating_per_owner": 8,
+  "bytes_per_token": 163840,
+  "gap_s_by_scenario": {
+    "STAY": 10.0,
+    "MOVE_IMMEDIATE": 0.0,
+    "MOVE_GAP": 10.0,
+    "MOVE_CONTENDED": 10.0
+  },
+  "mixed_length_arm": {
+    "prefix_tokens_per_session": [
+      4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096,
+      8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
+      8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
+      12288, 12288, 12288, 12288, 12288, 12288, 12288, 12288
+    ]
+  }
+}

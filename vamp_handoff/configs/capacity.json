@@ -1,0 +1,10 @@
+{
+  "_note": "Nominal lower-tier budgets (spec §4). metadata_reserve_bytes is a mock placeholder: the real payload capacity must be derived from the provider allocator's reported usable bytes before B0/B1 budgets are matched.",
+  "b0_b1_private_cpu_bytes_per_worker": 68719476736,
+  "b2_p_private_cpu_bytes_per_worker": 34359738368,
+  "shared_cxl_nominal_bytes": 68719476736,
+  "metadata_reserve_bytes_mock": 268435456,
+  "block_bytes": 5242880,
+  "ucsd_slice_device_range_reported": [68719476736, 137438953472],
+  "slice_origin_confirmed": false
+}

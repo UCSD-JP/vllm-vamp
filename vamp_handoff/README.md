@@ -24,6 +24,7 @@ v0.20 deprecation 문구가 있다는 사실만으로 release 이후 main이라�
 3. [기존 코드와 hook 위치](docs/code-map.md).
 4. [고정된 외부 shared-memory API 계약](docs/fixed-shared-memory-api.md).
 5. [Claude 개발 / Codex 검증 절차](docs/collaboration.md).
+6. [Read-only capability audit와 최소 backend 변경 제안](docs/capability-audit.md).
 
 ## 초기 검증: hash + 테스트 6개
 
@@ -50,9 +51,9 @@ Dynamo, torch 또는 실제 CXL library를 import하지 않습니다. upstream v
 | 05 | 회수한 Dynamo source 구문과 sidecar 존재 |
 | 06 | 기존 placement CASS 회귀 시나리오 |
 
-이것은 새 shared-CXL M1-M12 gate가 아닙니다. 새 runner/policy/adapter/mock은
-상세 명세에 따라 이제 구현할 대상입니다. hash 검증 실패 시 원인을 먼저 확인하고
-테스트만 녹색으로 만들기 위해 SOURCE_LOCK을 재생성하지 않습니다.
+이것은 새 shared-CXL M1-M12 gate가 아닙니다. M1-M12는 아래
+"GPU-free 구현 상태"의 `tests/test_offload_mock.py`에 있습니다. hash 검증 실패 시
+원인을 먼저 확인하고 테스트만 녹색으로 만들기 위해 SOURCE_LOCK을 재생성하지 않습니다.
 
 ## 포함 범위
 
@@ -102,3 +103,58 @@ Claude는 작업 branch에서 구현하고 commit SHA, 테스트 결과와 미�
 hash와 6개 테스트는 이 구조에서 통과했습니다. 실제 migration과 신규 M1-M12는
 아직 구현/검증되지 않았습니다. 전체 runtime, GPU wheel, 모델, 실제 trace payload는
 이 최소 패키지에 포함하지 않습니다.
+
+## GPU-free 구현 상태 (branch claude/cxl-migration-impl-ndi0p9)
+
+명세 §12의 파일을 `vamp_handoff/vamp_cxl/` 패키지로 구현했습니다. stdlib만 사용하고
+vLLM, torch, Dynamo, CXL library를 import하지 않습니다. 기존 vLLM hook 26개와
+reference 51개의 hash는 변경하지 않았습니다(`verify_source_lock.py` PASS).
+
+| 파일 | 책임 |
+| --- | --- |
+| `vamp_cxl/keys.py` | RunKey/RequestKey/ModelKey/PrefixKey/PayloadRef/LeaseId/JobId |
+| `vamp_cxl/offload_policy.py` | 순수 policy: B0/B1/B2/P_DELAY/P_VALUE, value score, calibration table, shadow wrapper |
+| `vamp_cxl/kv_transfer_adapter.py` | WorkerKVAdapter/SharedKVStore/RoutingAdapter 계약, capability report, fake clock/transport/store/worker, read-priority executor, §6 lifecycle coordinator, OffsetMapper |
+| `vamp_cxl/session_workload.py` | manifest 생성, tokenizer/template 주입, LCP 측정, public/ground-truth 분리 |
+| `vamp_cxl/session_replay.py` | per-session closed-loop runner, SSE 분류, event-level JSONL trace, target 검증, HTTP backend 골격 |
+| `vamp_cxl/simulation.py` | fake backend + coordinator + runner 결합, GPU-free cell 실행 CLI |
+| `vamp_cxl/summarize_migration_run.py` | trace join, baseline/fallback 구분, capacity/latency 보고 |
+| `configs/*.json` | frozen workload/policy/executor/capacity, mock calibration(라벨 `mock`) |
+| `tests/test_offload_mock.py` | M1-M12, 숫자 워크스루, cell smoke, config 고정 검사 |
+
+실행:
+
+```bash
+.venv/bin/python -S -m unittest discover -s vamp_handoff/tests -v
+cd vamp_handoff && ../.venv/bin/python -S -m vamp_cxl.simulation --sessions 32 --seed 0
+```
+
+### M1-M12 상태
+
+| Mock | 상태 | 검증한 것 |
+| --- | --- | --- |
+| M1 Manifest | PASS | 32×8,192 prefix 일치, 세션 격리, MML 이내, owner 16/16, 이동 8/8, ground truth 미노출 |
+| M2 Publication | PASS | CPU READY 전과 visibility 전에는 CXL READY/read 불가; DEFER 중 pin 없음 |
+| M3 Eviction | PASS | lookup 뒤 eviction → 명시 miss; pinned copy는 eviction 거부; defer 중 eviction → SKIP_SOURCE_EVICTED, stale export 없음 |
+| M4 Reader race | PASS | reader lease 동안 EVICTING 유지, slot 재할당 없음; release 후 새 generation으로 재사용 |
+| M5 Duplicate/ABA | PASS | 두 번째 writer는 ALREADY_WRITING; 이전 generation completion 거부; coordinator 중복 turn_end 단일 저장 |
+| M6 Cancel/error | PASS | write 실패/cancel/read 실패 후 lease/slot/job 원상 복귀; job당 terminal 1개; quiescence 전 해제 없음; silent retry 없음 |
+| M7 Policies | PASS | 50 > 38.5 STORE_NOW, read 1개 DEFER_READ_PRESSURE, write=200 SKIP_LOW_VALUE, 5 s 뒤 SKIP_DEFER_TIMEOUT(재시작 없음), stale/uncalibrated/NaN/closed/mismatch |
+| M8 Baselines | PASS | shadow P_VALUE 예외 주입 시 B0/B1 결정·target 불변, shadow_failed 표시 |
+| M9 No oracle | PASS | 과거 동일·미래 이동만 다른 두 manifest에서 첫 이동 dispatch 전 결정 동일 |
+| M10 Capacity | PASS | metadata reserve/rounding 반영 capacity, 초과 거부, slice 밖 offset 거부, origin 미확인 시 device offset 계산 거부, 중복 사본 점유 계산 |
+| M11 Runner | PASS | 전역 barrier 없음, role/usage-only chunk는 TTFT 미확정, admission delay 기록, misroute 시 target 미검증 기록 |
+| M12 Integration | PASS | out-of-order CPU ready/turn done/result에서 단일 store, consideration ID 추적, 미지 result 무시 |
+
+Mock 통과는 hardware capability 통과가 아닙니다. 32-session STAY/MOVE_GAP cell은
+fake 시계로 실행되며 latency는 sequencing용 상수입니다.
+
+### 아직 하지 않은 것
+
+- 실제 vLLM hook 접합(B0 경로 포함)과 Dynamo patch: `docs/capability-audit.md`의
+  최소 변경 5개는 제안이며 이 branch에 적용하지 않았습니다. `SOURCE_LOCK.json`의
+  `new_cxl_runtime_implemented`는 계속 `false`입니다.
+- G-A ~ G-H 실장비 gate, 실제 calibration, MOVE_IMMEDIATE/MOVE_CONTENDED 부하.
+- `HttpStreamingBackend`는 실장비용 골격이며 GPU-free 테스트에서 실행하지 않았습니다.
+- 균일 8K trace에서 P_VALUE는 mock calibration으로 전부 STORE_NOW를 냅니다.
+  명세대로 정상 결과이며 계수를 바꾸지 않았습니다.

@@ -1,0 +1,10 @@
+{
+  "_note": "MOCK ONLY (spec §7 numeric walkthrough). Never load on hardware. A real calibration_id must come from the separate probe campaign (spec §10) with per-path service times and queue wait recorded separately.",
+  "calibration_id": "mock-walkthrough-v0",
+  "source": "mock",
+  "points": [
+    {"prefix_tokens": 4096, "t_net_ms": 95.0, "t_recompute_ms": 450.0, "t_cxl_read_ms": 45.0, "t_cxl_write_ms": 20.0},
+    {"prefix_tokens": 8192, "t_net_ms": 180.0, "t_recompute_ms": 900.0, "t_cxl_read_ms": 80.0, "t_cxl_write_ms": 35.0},
+    {"prefix_tokens": 12288, "t_net_ms": 265.0, "t_recompute_ms": 1350.0, "t_cxl_read_ms": 115.0, "t_cxl_write_ms": 50.0}
+  ]
+}

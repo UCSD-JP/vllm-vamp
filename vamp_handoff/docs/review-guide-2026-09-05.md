@@ -85,7 +85,11 @@ python -S -m unittest discover -s vamp_handoff/tests            # 49 (torch 없�
    프로세스에서 spec이 2회 생성**된다는 점(실측: 같은 pid 120552에서 manager_created와 handlers_registered 모두 발생)과
    TP>1(multiproc)에서 worker 프로세스에는 manager가 없다는 점은 언급하지 않는다. 동작 버그는 아니고 **문서 공백** —
    `current_manager()`/`current_bridge()`가 어느 프로세스에서 유효한지 한 문장 추가 권장.
-3. G-B 이후: "worker당 4개 고정"을 강제·검증할 수단. receipt patch 적용(권장) 없이는 사후 sidecar 분포 확인만 가능.
+3. ~~G-B 이후: "worker당 4개 고정" 수단~~ → **G-B 실행 결과(같은 날 후속 커밋)**: stock KV router는 affinity를 만들지 않는다
+   (순차 48요청 매핑에서 7/8 세션이 worker 이동, router-side cached blocks 항상 0). 통과 조건(카운터 해석·무오류)은 PASS,
+   "고정" 전제는 BLOCKED. 해제에는 `patches/dynamo-vamp-receipt.patch` 적용 + pinning 경로가 필요하며 이는 별도 승인 항목.
+   또한 G-B 1차는 restore 셀과 prefix 생성기를 공유해 **cache 오염으로 invalid** 처리됨 — `solab/pressure_run.py --salt`와
+   cell 전 worker 재기동이 절차에 추가됐다. 리뷰 시 `gate-results` §G-B의 invalid 사유 기록이 숨김 없이 남았는지 확인.
 
 ## 5. 재현 (solab, GPU 자원 승인 필요)
 

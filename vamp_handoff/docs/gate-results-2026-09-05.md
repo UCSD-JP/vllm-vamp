@@ -85,11 +85,100 @@ connector 통계 없음(connector 없음). peak_kv_usage 0.044, running 1, waiti
 
 추가로 ON에서만 관측된 것: CPU READY 통지 6회(prefix 268 blocks + turn별 2 blocks), connector cold-miss 조회 4,430 tokens. 즉 **OffloadingConnector 경로가 GPU-local hit 계측을 바꾸지 않으며**, 첫 turn 이후 CPU tier에 prefix 사본이 READY 상태로 존재함이 listener로 확인됐다.
 
+## Restore 셀 (`restore`, G-A 보강 — VampOffloadingSpec로 CPU→GPU 복원 경로 실발동)
+
+G-A에서 restore가 0이었던 이유: vLLM OffloadingConnector는 **eager write-through**(`_get_reqs_to_store`가 매 step 새 block을
+CPU tier로 복사)라 store는 GPU 압력과 무관하게 발동하지만, restore는 **GPU miss 시에만** CPU tier를 조회한다. G-A는
+working set 4.3K ≪ pool 97.5K라 GPU가 항상 hit → 조회 자체가 없었다. 그래서 working set을 pool 위로 올렸다.
+
+설정: s1 단일 worker(VampOffloadingSpec, CPU tier 64GiB), **12 세션 × 3 turn, prompt 11,816 tok, concurrency 4**
+→ working set **141,792 tok = GPU pool의 1.45배** (12×739 = 8,868 blocks > 6,097 GPU blocks).
+
+| turn | ok | p50 | p95 | max |
+| --- | --- | --- | --- | --- |
+| 0 | 12/12 | 13.92 s | 16.04 s | 19.68 s |
+| 1 | 12/12 | **1.06 s** | 1.14 s | 1.14 s |
+| 2 | 12/12 | **1.08 s** | 1.13 s | 1.13 s |
+
+sidecar (cell 창 197 records):
+- GPU prefix: hits **0** / queries 431,484 — round-robin turn 순서에서 각 세션 prefix가 재사용 전에 11개 다른 세션에 밀려 전부 eviction. 정합.
+- **connector: hits 287,040 / queries 431,484 = 66.5%** — 3 turn 중 turn 1·2가 CPU tier에서 복원(기대 66.7%). **restore 경로 실발동 확정.**
+- peak_kv_usage 0.506 (= 동시 4 × 11.8K / 97.5K; vLLM `kv_cache_usage`는 running 할당만 세고 cached-free 블록은 free로 집계), peak_waiting 4.
+
+probe: READY **36회**(12 세션 × 3 turn), block 수 분포 {739: 10, 801: 1, 802: 1, 2: 22, 1: 2} — turn 0은 prefix 전체(11,816/16 = 739; 두 세션은 12,820 tok → 801/802), turn 1–2는 새 suffix 1–2 blocks. CPU tier eviction 0(9,039 blocks × 2.5 MiB ≈ 22 GB < 64 GiB).
+
+지연 해석: warm GPU hit 0.48 s(G-A) < **restore 1.06 s** < cold 13.9 s. restore가 재계산 대비 약 13배 빠르고, GPU hit 대비 ~0.6 s의 CPU→GPU 복사 비용(11.8K tok ≈ 1.85 GB)이 붙는다. 이 값은 s1 host DRAM→A6000 경로의 **첫 실측 calibration point**이지만 no-queue probe가 아니므로(concurrency 4) §10 calibration table에 그대로 넣지 않는다.
+
+## G-B: 8 sessions, 각 worker 4개 고정 (headroom)
+
+토폴로지: s1 + s2 각 1 worker(VampOffloadingSpec, CPU tier 64GiB), frontend KV router. 8 세션 × 6 turn, prompt ≈4,325 tok,
+**concurrency 1(순차)** — router 결정을 요청과 1:1 매핑하기 위함. working set 34,600 tok ≪ 2×97,552 (headroom).
+"worker당 4개 **고정**"을 강제할 수단은 이 스택에 없으므로(receipt patch 미적용, per-request pinning 없음) 분배는 router에 맡기고 사후 매핑으로 관측했다.
+
+### 1차 (`gb`) — **INVALID: cross-cell cache 오염**
+
+48/48 ok, 매핑 유효(48 = 48). 그러나 s1 sidecar에 **connector hit 21,520 / 22,033 (97.7%)**, turn 0에 0.48–0.52 s GPU-hit 3건 —
+첫 방문 세션이 tier에 있을 수 없다. 원인: restore 셀과 같은 prefix 생성기(`s{sid}-item{i}`, 370단어는 1000단어의 접두어)라
+s1의 GPU(최근 8세션 분)와 CPU tier(전부)에 restore 셀 잔존 캐시가 있었다. spec §9 "cross-cell cache 오염 → cell invalid" 적용.
+raw는 `gb_*`로 보존(숨기지 않음). 조치: `pressure_run.py --salt <cell>`(prefix에 cell 태그 혼입) + cell 전 양 worker 재기동으로 tier 초기화 → `gb2`.
+
+### 캐시와 무관하게 유효한 발견 — router affinity 부재
+
+`solab/gb_map.py`(순차 요청 ↔ frontend `Selected worker` 1:1):
+
+```
+session 0: W0 W0 W1 W1 W0 W0  MOVED      session 4: W1 W1 W0 W0 W1 W1  MOVED
+session 1: W1 W1 W0 W1 W0 W1  MOVED      session 5: W1 W0 W0 W0 W0 W1  MOVED
+session 2: W0 W1 W1 W1 W1 W0  MOVED      session 6: W1 W0 W1 W0 W0 W1  MOVED
+session 3: W1 W1 W1 W1 W0 W0  MOVED      session 7: W0 W1 W1 W1 W0 W1  MOVED
+sessions that changed worker: 8/8 · per-worker distinct sessions: W0=8, W1=8 · router cached blocks by turn: all 0
+```
+
+**Dynamo 0.5.0 KV router의 overlap 항이 이 배치에서 죽어 있다**(KV event가 router radix에 반영되지 않음 → `cached blocks: 0` →
+logit이 두 worker에 동일 → load/tie-break로 교대). 따라서 stock "KV router"는 여기서 KV-aware하지 않고, "worker당 4개 고정"은
+receipt patch + pinning(또는 experiment router) 없이는 성립하지 않는다. 앞선 routing smoke의 대칭 hit(49.6/49.7%)을 affinity로
+읽은 것은 오독이었다 — headroom에서 양 worker가 모든 prefix를 결국 캐시한 결과.
+
+### 2차 (`gb2`, `--salt gb2` + 양 worker 재기동으로 tier 초기화) — 유효
+
+48/48 ok, prompt ≈5,072 tok(salt로 길어짐), working set 40,576 ≪ 195,104. warm-up이 stale-instance 500을 다시 흡수(기록, 제외).
+
+매핑(`gb_map.py`): **7/8 세션 이동**(session 6만 우연히 sticky), W0(…8820)=s1이 7세션·27요청, W1(…8824)=s2가 8세션·21요청, router `cached blocks` 전 turn 0.
+
+| turn | p50 | 분포 |
+| --- | --- | --- |
+| 0 | 1.75 s | 8건 전부 cold (1.73–1.81) |
+| 1 | 1.74 s | 4건 0.48–0.50 / 4건 1.74–1.77 |
+| 2 | 0.49 s | 7건 0.48–0.50 / 1건 1.76 |
+| 3 | 0.50 s | 6건 0.48–0.50 / 2건 1.75–1.78 |
+| 4–5 | 0.49 s | 16건 전부 0.48–0.50 |
+
+**turn>0의 느린 요청 7건 전부가 "그 세션이 그 worker를 처음 방문"한 요청**이고(gb_map 교차), 그 외는 전부 GPU hit.
+cold 총 15건 = 서로 다른 (세션, worker) 쌍 15개 (W0 7 + W1 8) — 정확히 일치.
+
+worker별 sidecar (cell 창):
+
+| worker | 요청 | cold(첫 방문) | GPU prefix hit | 기대 (요청−cold)/요청 | connector | READY 통지 | ready blocks |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| s1 (W0) | 27 | 7 | **100,960 / 136,991 = 73.7%** | 20/27 = 74.1% | 0 / 36,031 | 27 | 2,249 (≈7×317 + suffix) |
+| s2 (W1) | 21 | 8 | **65,616 / 106,543 = 61.6%** | 13/21 = 61.9% | 0 / 40,927 | 21 | 2,556 (≈8×317 + suffix) |
+
+connector queries 합 76,958 ≈ 15 cold × 5,072 tok(cold 시 빈 CPU tier 조회) → hit 0 정상(첫 방문이라 그 worker의 CPU tier에 없음).
+restore 미발생 정상(headroom, GPU eviction 없음). peak_kv_usage 0.052, waiting 0, 오류 0.
+
+### G-B 판정: 통과 조건 **PASS**, 전제 조건 **BLOCKED**
+
+- 통과 조건 "headroom에서 GPU/connector 카운터 해석 가능; 오류 없음": **PASS** — 모든 카운터가 (세션, worker) 첫 방문 모델로
+  검산 일치, 오류 0.
+- 전제 "각 worker 4개 **고정**": **BLOCKED** — stock KV router가 affinity를 만들지 않아(7/8 이동) 고정을 강제·검증할 수단이 없다.
+  해제 조건: `patches/dynamo-vamp-receipt.patch` 적용(target receipt) + per-request pinning 수단(`vamp_target_worker` 전달 경로 확인).
+  G-C("실제 다른 worker 실행" 검증)도 같은 해제 조건에 걸린다.
+
 ## 다른 gate
 
 | Gate | 상태 | 비고 |
 | --- | --- | --- |
-| G-B | NOT_RUN | 다음 순서 (8 sessions, worker당 4 고정 — s2 worker 재기동 필요) |
+| G-B | **PASS(조건) / BLOCKED(고정 전제)** | 1차 INVALID(cache 오염) → 2차 유효. 위 참조 |
 | G-C | NOT_RUN | receipt patch 미적용 상태에서는 "실제 다른 worker 실행" 검증 수단이 sidecar 분포뿐 |
 | G-D | NOT_RUN | scheduler↔worker RPC 미구현(in-process mailbox까지) |
 | G-E~G-G | NOT_RUN | 실제 CXL 접근 — **별도 안전 승인 전 실행 금지**(manager protocol/offset origin 미확인) |

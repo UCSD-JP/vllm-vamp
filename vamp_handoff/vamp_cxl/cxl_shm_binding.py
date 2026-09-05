@@ -370,7 +370,8 @@ MAGIC = b"VAMPKV01"
 # magic, version, state, generation, payload_offset, payload_len, rounded_len,
 # reader_count, checksum, model digest, prefix digest, writer id
 _ENTRY = struct.Struct("!8sIIQQQQQ64s64s64s32s")
-_DIR = struct.Struct("!8sQQ32s")  # magic, next_generation, entries, allocator_id
+# magic, next_generation, entries, allocator_id, owner writer_id (single manager)
+_DIR = struct.Struct("!8sQQ32s32s")
 
 
 class EntryState(int, Enum):
@@ -499,10 +500,22 @@ class CxlSharedKVStore(SharedKVStore):
         self._dir_lock = api.lock_alloc()
         self._dir_key = f"{namespace}:vamp:directory"
         ptr = api.get(self._dir_key)
+        owner = writer_id.encode()[:32]
         if ptr is None:
             ptr = api.shmalloc(_DIR.size)
-            api.write(ptr, _DIR.pack(MAGIC, 1, 0, self.allocator_id.encode()[:32]))
+            api.write(
+                ptr, _DIR.pack(MAGIC, 1, 0, self.allocator_id.encode()[:32], owner)
+            )
             api.put(self._dir_key, ptr)
+            self.read_only = False
+        else:
+            magic, _, _, _, dir_owner = _DIR.unpack(api.read(ptr, _DIR.size))
+            if magic != MAGIC:
+                raise ValueError("shared directory magic mismatch (layout changed?)")
+            # Single-manager mode: only the instance that created the directory
+            # may reserve. Capacity accounting (_occupied) is per instance, so a
+            # second writer in the same namespace would over-commit the budget.
+            self.read_only = dir_owner.rstrip(b"\0") != owner.rstrip(b"\0")
         self._dir_ptr = ptr
 
     # -- helpers ------------------------------------------------------------
@@ -522,10 +535,12 @@ class CxlSharedKVStore(SharedKVStore):
     def _next_generation(self) -> int:
         self.api.lock_acquire(self._dir_lock)
         try:
-            magic, nxt, count, alloc = _DIR.unpack(
+            magic, nxt, count, alloc, owner = _DIR.unpack(
                 self.api.read(self._dir_ptr, _DIR.size)
             )
-            self.api.write(self._dir_ptr, _DIR.pack(magic, nxt + 1, count + 1, alloc))
+            self.api.write(
+                self._dir_ptr, _DIR.pack(magic, nxt + 1, count + 1, alloc, owner)
+            )
             return nxt + 1
         finally:
             self.api.lock_release(self._dir_lock)
@@ -559,6 +574,8 @@ class CxlSharedKVStore(SharedKVStore):
                     ReserveStatus.ALREADY_WRITING, existing_generation=rec.generation
                 )
             return ReserveResult(ReserveStatus.BUSY, existing_generation=rec.generation)
+        if self.read_only:
+            return ReserveResult(ReserveStatus.REJECTED_READ_ONLY)
         rounded = self.capacity.round_up(nbytes)
         if self._occupied + rounded > self.capacity.payload_capacity_bytes:
             return ReserveResult(ReserveStatus.REJECTED_CAPACITY)
@@ -825,6 +842,7 @@ class CxlCopyJob:
     fail_at_chunk: int | None = None
     terminal_emitted: bool = False
     visible_emitted: bool = False
+    fenced: bool = False  # write fence ran successfully before COMPLETED
     thread: threading.Thread | None = field(default=None, repr=False)
 
     @property
@@ -839,16 +857,25 @@ class CxlCopyTransport:
     """Chunked memcpy through the provider read/write surface. No visibility
     primitive is exposed by the fixed API, so VISIBLE is emitted only when a
     ``fence`` callable is supplied by the operator; otherwise READY can never
-    be committed through this transport (fail closed)."""
+    be committed through this transport (fail closed).
+
+    Coherence rules (non-coherent CXL): a write job runs ``fence(dest, n)``
+    *before* it is reported COMPLETED, and a fence failure makes the job
+    FAILED, never DONE. A read job runs ``refresh(src, n)`` (invalidate stale
+    local lines) before the first chunk; without an operator-supplied
+    ``refresh`` a read job fails closed unless the provider is the emulated
+    in-process one, whose reads are trivially coherent."""
 
     def __init__(
         self,
         api: ProviderApi,
         fence: Callable[[int, int], None] | None = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
+        refresh: Callable[[int, int], None] | None = None,
     ):
         self.api = api
         self.fence = fence
+        self.refresh = refresh
         self.clock_ns = clock_ns
         self.jobs: dict[JobId, CxlCopyJob] = {}
         self._events: list[TransferEvent] = []
@@ -914,12 +941,7 @@ class CxlCopyTransport:
                 bytes_done=min(job.nbytes, job.chunks_done * job.chunk_bytes),
             )
         )
-        if (
-            state == JobState.DONE
-            and self.fence is not None
-            and job.dest_ptr is not None
-        ):
-            self.fence(job.dest_ptr, job.nbytes)
+        if state == JobState.DONE and job.fenced:
             job.visible_emitted = True
             self._emit(
                 TransferEvent(
@@ -929,6 +951,16 @@ class CxlCopyTransport:
 
     def _run(self, job: CxlCopyJob) -> None:
         try:
+            if job.read_ptr is not None and job.sink is not None:
+                if self.refresh is not None:
+                    self.refresh(job.read_ptr, job.nbytes)
+                elif not self.api.is_emulated:
+                    self._terminate(
+                        job,
+                        JobState.FAILED,
+                        "no refresh primitive for read; refusing possibly stale read",
+                    )
+                    return
             for idx in range(job.chunks_total):
                 if job.cancel_requested:
                     self._terminate(
@@ -949,6 +981,14 @@ class CxlCopyTransport:
                         job.read_ptr + start, length
                     )
                 job.chunks_done = idx + 1
+            if job.dest_ptr is not None and self.fence is not None:
+                # fence first: a write is only complete once it is visible.
+                try:
+                    self.fence(job.dest_ptr, job.nbytes)
+                except Exception as exc:  # noqa: BLE001 - reported as FAILED
+                    self._terminate(job, JobState.FAILED, f"fence failed: {exc}")
+                    return
+                job.fenced = True
             self._terminate(job, JobState.DONE, None)
         except Exception as exc:  # noqa: BLE001 - reported as a terminal event
             if not job.terminal_emitted:

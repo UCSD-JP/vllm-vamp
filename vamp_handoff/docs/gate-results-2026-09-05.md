@@ -92,7 +92,7 @@ CPU tier로 복사)라 store는 GPU 압력과 무관하게 발동하지만, rest
 working set 4.3K ≪ pool 97.5K라 GPU가 항상 hit → 조회 자체가 없었다. 그래서 working set을 pool 위로 올렸다.
 
 설정: s1 단일 worker(VampOffloadingSpec, CPU tier 64GiB), **12 세션 × 3 turn, prompt 11,816 tok, concurrency 4**
-→ working set **141,792 tok = GPU pool의 1.45배** (12×739 = 8,868 blocks > 6,097 GPU blocks).
+→ working set **143,828 tok(turn 0 prompt_tokens 실합; 두 세션은 12,820) = GPU pool의 1.47배** (≈8,990 blocks > 6,097 GPU blocks).
 
 | turn | ok | p50 | p95 | max |
 | --- | --- | --- | --- | --- |
@@ -107,7 +107,7 @@ sidecar (cell 창 197 records):
 
 probe: READY **36회**(12 세션 × 3 turn), block 수 분포 {739: 10, 801: 1, 802: 1, 2: 22, 1: 2} — turn 0은 prefix 전체(11,816/16 = 739; 두 세션은 12,820 tok → 801/802), turn 1–2는 새 suffix 1–2 blocks. CPU tier eviction 0(9,039 blocks × 2.5 MiB ≈ 22 GB < 64 GiB).
 
-지연 해석: warm GPU hit 0.48 s(G-A) < **restore 1.06 s** < cold 13.9 s. restore가 재계산 대비 약 13배 빠르고, GPU hit 대비 ~0.6 s의 CPU→GPU 복사 비용(11.8K tok ≈ 1.85 GB)이 붙는다. 이 값은 s1 host DRAM→A6000 경로의 **첫 실측 calibration point**이지만 no-queue probe가 아니므로(concurrency 4) §10 calibration table에 그대로 넣지 않는다.
+지연 관측: cold round p50 13.9 s, reuse(restore) round p50 1.06 s; 참고로 G-A의 GPU-hit round는 0.48 s. 이는 **concurrency 4에서의 응답 지연 차이**(큐 대기, suffix prefill 포함)이며 통제된 성능 비교나 service time이 아니다 — "restore가 N배 빠르다"나 "복사 비용 X초"로 환원하지 않는다. READY 통지 36회는 store 이벤트 수이며 restore 횟수가 아니다(restore는 connector hit 합계로만 관측). calibration은 §10의 no-queue probe로 별도 측정한다.
 
 ## G-B: 8 sessions, 각 worker 4개 고정 (headroom)
 
@@ -134,9 +134,10 @@ session 3: W1 W1 W1 W1 W0 W0  MOVED      session 7: W0 W1 W1 W1 W0 W1  MOVED
 sessions that changed worker: 8/8 · per-worker distinct sessions: W0=8, W1=8 · router cached blocks by turn: all 0
 ```
 
-**Dynamo 0.5.0 KV router의 overlap 항이 이 배치에서 죽어 있다**(KV event가 router radix에 반영되지 않음 → `cached blocks: 0` →
-logit이 두 worker에 동일 → load/tie-break로 교대). 따라서 stock "KV router"는 여기서 KV-aware하지 않고, "worker당 4개 고정"은
-receipt patch + pinning(또는 experiment router) 없이는 성립하지 않는다. 앞선 routing smoke의 대칭 hit(49.6/49.7%)을 affinity로
+**이 배치에서는 Dynamo 0.5.0 KV router의 overlap 신호와 안정적인 affinity를 관측하지 못했다**(router-side `cached blocks`가 항상 0 →
+logit이 두 worker에 동일 → load/tie-break로 교대한 것으로 보인다; KV event가 router에 도달하지 않는 원인은 미조사). 따라서 이 배치의
+stock router로는 "worker당 4개 고정"이 성립하지 않는다. receipt patch는 **실행 worker를 확인·거부하는 기능**이고 지정 worker로 보내는
+기능이 아니므로, 고정에는 별도 targeting 수단(검증된 단일-worker endpoint 또는 experiment router)이 필요하다. 앞선 routing smoke의 대칭 hit(49.6/49.7%)을 affinity로
 읽은 것은 오독이었다 — headroom에서 양 worker가 모든 prefix를 결국 캐시한 결과.
 
 ### 2차 (`gb2`, `--salt gb2` + 양 worker 재기동으로 tier 초기화) — 유효
@@ -178,7 +179,7 @@ restore 미발생 정상(headroom, GPU eviction 없음). peak_kv_usage 0.052, wa
 
 | Gate | 상태 | 비고 |
 | --- | --- | --- |
-| G-B | **PASS(조건) / BLOCKED(고정 전제)** | 1차 INVALID(cache 오염) → 2차 유효. 위 참조 |
+| G-B | **headroom 계측 진단 완료 / 고정 배치 미검증** | 통과 조건(카운터 해석·무오류) 충족, "worker당 4 고정" 전제 미충족. 1차 INVALID(cache 오염) → 2차 유효 |
 | G-C | NOT_RUN | receipt patch 미적용 상태에서는 "실제 다른 worker 실행" 검증 수단이 sidecar 분포뿐 |
 | G-D | NOT_RUN | scheduler↔worker RPC 미구현(in-process mailbox까지) |
 | G-E~G-G | NOT_RUN | 실제 CXL 접근 — **별도 안전 승인 전 실행 금지**(manager protocol/offset origin 미확인) |

@@ -279,6 +279,121 @@ class EmulatedStore(unittest.TestCase):
         nofence.wait(job2.job_id)
         self.assertNotIn(TransferEventKind.VISIBLE, [e.kind for e in nofence.poll()])
 
+    def _write_job(self, store, res, data, job_id="w"):
+        return CxlCopyJob(
+            JobId(job_id),
+            memoryview(data),
+            store.payload_ptr(res),
+            None,
+            None,
+            len(data),
+            1024,
+            res.generation,
+            res.reservation_id,
+            store.allocator_id,
+            "chk",
+            TransferKind.CXL_WRITE,
+            TransferPriority.BACKGROUND,
+        )
+
+    def _read_job(self, store, res, sink, job_id="r"):
+        return CxlCopyJob(
+            JobId(job_id),
+            None,
+            None,
+            store.payload_ptr(res),
+            sink,
+            len(sink),
+            512,
+            res.generation,
+            None,
+            store.allocator_id,
+            "chk",
+            TransferKind.CXL_READ,
+            TransferPriority.DEMAND,
+        )
+
+    def test_fence_failure_is_failed_not_done(self):
+        # A write whose fence fails is not complete: it must be FAILED with no
+        # completion proof (so commit_ready is impossible), never DONE/VISIBLE.
+        from vamp_cxl.cxl_shm_binding import JobState
+
+        store, api = make_store()
+        res = store.reserve(prefix(salt="fence"), 2048, "w0").reservation
+        store.mark_writing(res)
+
+        def bad_fence(ptr, n):
+            raise OSError("fence unavailable")
+
+        transport = CxlCopyTransport(api, fence=bad_fence)
+        job = self._write_job(store, res, bytearray(os.urandom(2048)), "wf")
+        transport.submit(job)
+        transport.start(job.job_id)
+        transport.wait(job.job_id)
+        events = transport.poll()
+        self.assertEqual(
+            [e.kind for e in events],
+            [TransferEventKind.STARTED, TransferEventKind.FAILED],
+        )
+        self.assertEqual(job.state, JobState.FAILED)
+        self.assertIn("fence failed", events[-1].error)
+        self.assertIsNone(events[-1].proof)
+        self.assertFalse(job.visible_emitted)
+
+    def test_read_without_refresh_fails_closed_on_non_emulated_provider(self):
+        class _RealLike(EmulatedProviderApi):
+            is_emulated = False  # coherence is not implied, as with the ctypes provider
+
+        store, api = make_store(api=_RealLike(64 * BLK))
+        res = store.reserve(prefix(salt="rd"), 1024, "w0").reservation
+        store.mark_writing(res)
+        data = bytearray(os.urandom(1024))
+        api.write(store.payload_ptr(res), bytes(data))
+        sink = bytearray(1024)
+        norefresh = CxlCopyTransport(api)
+        rjob = self._read_job(store, res, sink, "r-norefresh")
+        norefresh.submit(rjob)
+        norefresh.start(rjob.job_id)
+        norefresh.wait(rjob.job_id)
+        ev = norefresh.poll()
+        self.assertEqual(ev[-1].kind, TransferEventKind.FAILED)
+        self.assertIn("refresh", ev[-1].error)
+        self.assertNotEqual(bytes(sink), bytes(data))
+        refreshed = []
+        withrefresh = CxlCopyTransport(
+            api, refresh=lambda ptr, n: refreshed.append((ptr, n))
+        )
+        rjob2 = self._read_job(store, res, sink, "r-refresh")
+        withrefresh.submit(rjob2)
+        withrefresh.start(rjob2.job_id)
+        withrefresh.wait(rjob2.job_id)
+        self.assertEqual(withrefresh.poll()[-1].kind, TransferEventKind.COMPLETED)
+        self.assertEqual(refreshed, [(store.payload_ptr(res), 1024)])
+        self.assertEqual(bytes(sink), bytes(data))
+
+    def test_second_instance_is_read_only_no_double_accounting(self):
+        # Single-manager mode: capacity is tracked per instance, so a second
+        # writer in the same namespace would over-commit the shared budget.
+        store, api = make_store(capacity_blocks=2)
+        self.assertFalse(store.read_only)
+        other, _ = make_store(api=api, writer="w1", capacity_blocks=2)
+        self.assertTrue(other.read_only)
+        a = store.reserve(prefix(salt="a"), BLK, "w0")
+        b = store.reserve(prefix(salt="b"), BLK, "w0")
+        self.assertEqual(
+            (a.status, b.status), (ReserveStatus.RESERVED, ReserveStatus.RESERVED)
+        )
+        self.assertEqual(
+            other.reserve(prefix(salt="c"), BLK, "w1").status,
+            ReserveStatus.REJECTED_READ_ONLY,
+        )
+        # existing entries are still reported to the read-only instance
+        self.assertEqual(
+            other.reserve(prefix(salt="a"), 1, "w1").status,
+            ReserveStatus.ALREADY_WRITING,
+        )
+        self.assertEqual(store._occupied + other._occupied, 2 * BLK)
+
 
 class CtypesBindingRefusesUnconfirmed(unittest.TestCase):
     def test_no_library_offline(self):

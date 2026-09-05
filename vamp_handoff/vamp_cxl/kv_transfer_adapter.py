@@ -622,6 +622,7 @@ class ReserveStatus(str, Enum):
     BUSY = "BUSY"
     REJECTED_CAPACITY = "REJECTED_CAPACITY"
     REJECTED_BOUNDS = "REJECTED_BOUNDS"
+    REJECTED_READ_ONLY = "REJECTED_READ_ONLY"  # not the single manager of this namespace
 
 
 @dataclass(frozen=True)

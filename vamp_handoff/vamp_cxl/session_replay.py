@@ -277,6 +277,14 @@ class SessionReplayRunner:
 
     def _on_chunk(self, key: RequestKey, chunk: StreamChunk) -> None:
         trace = self.traces[key]
+        # Usage may ride on any chunk (Dynamo 0.5.0 attaches it to every
+        # delta, OpenAI sends a trailing usage-only chunk); record it wherever
+        # it appears so the written response_done carries the final values.
+        if chunk.usage:
+            trace.usage_observed = True
+            trace.prompt_tokens = chunk.usage.get("prompt_tokens")
+            trace.completion_tokens = chunk.usage.get("completion_tokens")
+            trace.cached_tokens = chunk.usage.get("cached_tokens")
         if chunk.kind == ChunkKind.ROLE:
             if trace.first_role_ns is None:
                 trace.first_role_ns = chunk.now_ns
@@ -287,11 +295,8 @@ class SessionReplayRunner:
             if trace.first_content_ns is None:
                 trace.first_content_ns = chunk.now_ns
             trace.output_text += chunk.text
-        elif chunk.kind == ChunkKind.USAGE and chunk.usage:
-            trace.usage_observed = True
-            trace.prompt_tokens = chunk.usage.get("prompt_tokens")
-            trace.completion_tokens = chunk.usage.get("completion_tokens")
-            trace.cached_tokens = chunk.usage.get("cached_tokens")
+        elif chunk.kind == ChunkKind.USAGE:
+            pass  # recorded above
         elif chunk.kind == ChunkKind.ERROR:
             trace.error = chunk.error
             trace.status = "error"
@@ -418,6 +423,13 @@ class HttpStreamingBackend:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
                 worker = resp.headers.get(self.worker_header)
+                # The finish_reason chunk is held back and emitted as the
+                # single DONE only once the stream closes, so a trailing
+                # usage-only chunk (OpenAI style) is seen by the runner before
+                # response_done is written. The DONE keeps the finish time.
+                finish_ns: int | None = None
+                finish_worker: str | None = None
+                last_usage: dict[str, int] | None = None
                 for raw in resp:
                     line = raw.decode("utf-8", "replace").rstrip("\r\n")
                     obj = parse_sse_data(line)
@@ -425,11 +437,14 @@ class HttpStreamingBackend:
                         continue
                     now = time.monotonic_ns()
                     if obj.get("__done__"):
-                        self._queue.put(
-                            (key, StreamChunk(ChunkKind.DONE, now, worker_id=worker))
-                        )
                         break
+                    if obj.get("usage"):
+                        last_usage = obj["usage"]
                     kind, text = classify_chunk(obj)
+                    if kind == ChunkKind.DONE:
+                        finish_ns = now
+                        finish_worker = worker or obj.get("worker_id")
+                        continue
                     self._queue.put(
                         (
                             key,
@@ -442,6 +457,17 @@ class HttpStreamingBackend:
                             ),
                         )
                     )
+                self._queue.put(
+                    (
+                        key,
+                        StreamChunk(
+                            ChunkKind.DONE,
+                            finish_ns if finish_ns is not None else time.monotonic_ns(),
+                            usage=last_usage,
+                            worker_id=finish_worker or worker,
+                        ),
+                    )
+                )
         except Exception as exc:  # noqa: BLE001 - reported in the trace
             self._queue.put(
                 (

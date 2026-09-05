@@ -137,6 +137,12 @@ class VampCPUOffloadingManager(CPUOffloadingManager):
                 fn, fut = self._mailbox.get_nowait()
             except queue.Empty:
                 return
+            # A caller that gave up (fut.cancel()) must not have its command
+            # executed: running it would leak a lease and set_result would
+            # raise InvalidStateError into the scheduler step.
+            if not fut.set_running_or_notify_cancel():
+                self._count("mailbox_cancelled")
+                continue
             try:
                 fut.set_result(fn())
             except Exception as exc:  # noqa: BLE001 - delivered to the caller
@@ -170,11 +176,19 @@ class VampCPUOffloadingManager(CPUOffloadingManager):
         out = super().prepare_store(block_hashes)
         if out is not None and out.block_hashes_evicted and self.listener is not None:
             self.listener.on_blocks_evicted(list(out.block_hashes_evicted))
+        self._drain_mailbox()
         return out
 
     def complete_store(
         self, block_hashes: Iterable[BlockHash], success: bool = True
     ) -> None:
+        """Marks blocks READY and notifies the listener on the scheduler
+        thread. The listener may call ``acquire_export_lease`` directly (it is
+        on the owner thread), which is how a publication that must start in a
+        request-free gap gets its pin: the engine may not run another step
+        (and so never drain the mailbox) until the next request arrives, so
+        the lease has to be taken here, synchronously. Commands posted to the
+        mailbox during the callback are drained before returning."""
         self._on_owner_thread()
         hashes = list(block_hashes)
         newly_ready: list[BlockHash] = []
@@ -187,6 +201,7 @@ class VampCPUOffloadingManager(CPUOffloadingManager):
         if newly_ready and self.listener is not None:
             self._count("ready_notifications")
             self.listener.on_blocks_ready(newly_ready)
+        self._drain_mailbox()
 
     # -- export lease (scheduler thread) ------------------------------------
 

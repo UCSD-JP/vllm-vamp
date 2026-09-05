@@ -132,6 +132,49 @@ class SchedulerSideBinding(unittest.TestCase):
         with self.assertRaises(KeyError):
             bad.result()
 
+    def test_cancelled_mailbox_command_is_skipped_without_leak(self):
+        # Regression: a cancelled Future used to be executed (leaking a lease)
+        # and then raise InvalidStateError out of lookup() on the scheduler thread.
+        m, _ = self._manager()
+        a, b = self._store(m, ["a", "b"])
+        fut = m.acquire_export_lease_async([a, b])
+        fut.cancel()
+        m.lookup([a])  # must not raise
+        self.assertTrue(fut.cancelled())
+        self.assertEqual(m.active_leases(), 0)
+        self.assertEqual(m.counters.get("lease_acquired", 0), 0)
+        self.assertEqual(m.counters.get("mailbox_cancelled"), 1)
+
+    def test_listener_acquires_lease_synchronously_in_ready_callback(self):
+        # Gap publication: the pin must be taken inside on_blocks_ready (owner
+        # thread) because the engine may run no further step until the next
+        # request, so a mailbox command could sit undrained for the whole gap.
+        m, _ = self._manager()
+        grabbed = []
+
+        class _Grab(_Listener):
+            def on_blocks_ready(self, hashes):
+                super().on_blocks_ready(hashes)
+                if not grabbed:  # publish the first READY run only
+                    grabbed.append(m.acquire_export_lease(list(hashes)))
+
+        m.listener = _Grab()
+        a, b = self._store(m, ["a", "b"])
+        self.assertEqual(len(grabbed), 1)
+        self.assertIsNotNone(grabbed[0])
+        self.assertEqual(grabbed[0].block_hashes, (a, b))
+        self.assertEqual(m.active_leases(), 1)
+        # commands posted meanwhile are drained by prepare_store/complete_store
+        # themselves, not only by lookup/take_events
+        rel = m.release_export_lease_async(grabbed[0])
+        self.assertFalse(rel.done())
+        out = m.prepare_store([bh("c")])  # drains: release runs here
+        self.assertTrue(rel.done())
+        self.assertEqual(m.active_leases(), 0)
+        m.complete_store(out.block_hashes_to_store)  # second READY: no new grab
+        self.assertEqual(len(grabbed), 1)
+        self.assertEqual(m.active_leases(), 0)
+
     def test_import_reservation_and_commit(self):
         m, listener = self._manager()
         res = m.reserve_import([bh("x"), bh("y")])

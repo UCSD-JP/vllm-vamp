@@ -30,6 +30,9 @@ from vamp_cxl.session_workload import WorkloadConfig, build_manifest  # noqa: E4
 class _Handler(BaseHTTPRequestHandler):
     seen: list[dict] = []
     worker_map: dict[str, str] = {}
+    # "openai": usage arrives in a trailing usage-only chunk after finish_reason
+    # "dynamo": usage rides on every chunk (observed on Dynamo 0.5.0), no usage-only chunk
+    style: str = "openai"
 
     def log_message(self, *args):  # silence
         return
@@ -57,23 +60,23 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
             self.wfile.flush()
 
-        sse({"choices": [{"delta": {"role": "assistant"}}]})
-        self.wfile.write(b": keep-alive\n\n")
-        time.sleep(0.02)
-        sse({"choices": [{"delta": {"reasoning_content": "thinking"}}]})
-        time.sleep(0.02)
-        sse({"choices": [{"delta": {"content": marker}}]})
-        sse({"choices": [{"delta": {}, "finish_reason": "stop"}]})
-        sse(
-            {
-                "choices": [],
-                "usage": {
-                    "prompt_tokens": 123,
-                    "completion_tokens": 3,
-                    "cached_tokens": 100,
-                },
-            }
-        )
+        usage = {"prompt_tokens": 123, "completion_tokens": 3, "cached_tokens": 100}
+        if _Handler.style == "dynamo":
+            sse({"choices": [{"delta": {"role": "assistant"}}], "usage": usage})
+            time.sleep(0.02)
+            sse({"choices": [{"delta": {"reasoning_content": "thinking"}}], "usage": usage})
+            time.sleep(0.02)
+            sse({"choices": [{"delta": {"content": marker}}], "usage": usage})
+            sse({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": usage})
+        else:
+            sse({"choices": [{"delta": {"role": "assistant"}}]})
+            self.wfile.write(b": keep-alive\n\n")
+            time.sleep(0.02)
+            sse({"choices": [{"delta": {"reasoning_content": "thinking"}}]})
+            time.sleep(0.02)
+            sse({"choices": [{"delta": {"content": marker}}]})
+            sse({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+            sse({"choices": [], "usage": usage})
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
@@ -90,9 +93,10 @@ class HttpBackendTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.server.shutdown()
 
-    def _run(self, cfg, misroute=None):
+    def _run(self, cfg, misroute=None, style="openai"):
         _Handler.seen = []
         _Handler.worker_map = misroute or {}
+        _Handler.style = style
         manifest = build_manifest(cfg)
         backend = HttpStreamingBackend(self.url, cfg.model)
         clock = MonotonicClock()
@@ -136,6 +140,28 @@ class HttpBackendTests(unittest.TestCase):
         self.assertGreater(
             sum(1 for e in trace.events if e["event"] == "response_done"), 0
         )
+
+    def test_usage_is_in_the_written_response_done_for_both_stream_styles(self):
+        # Regression: response_done used to be written at finish_reason, before
+        # a trailing usage chunk arrived, so the saved trace lacked usage while
+        # the in-memory trace had it. Check the written events, not the objects.
+        for style in ("openai", "dynamo"):
+            cfg = WorkloadConfig(sessions=2, turns_per_session=1, gap_s=0.0, seed=7)
+            runner, trace = self._run(cfg, style=style)
+            done = [e for e in trace.events if e["event"] == "response_done"]
+            self.assertEqual(len(done), 2, style)
+            for e in done:
+                self.assertEqual(e["status"], "ok", style)
+                self.assertTrue(e["usage_observed"], style)
+                self.assertEqual(
+                    (e["prompt_tokens"], e["completion_tokens"], e["cached_tokens"]),
+                    (123, 3, 100),
+                    style,
+                )
+                self.assertIsNotNone(e["ttft_content_ns"], style)
+                self.assertIsNotNone(e["e2e_ns"], style)
+                self.assertTrue(e["marker_ok"], style)
+                self.assertTrue(e["target_verified"], style)
 
     def test_misrouted_worker_is_flagged_not_assumed(self):
         cfg = WorkloadConfig(sessions=2, turns_per_session=1, gap_s=0.0, seed=6)

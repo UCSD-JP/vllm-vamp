@@ -102,3 +102,22 @@ python3 ~/vamp/ga_report.py --cell ga_on --runner ~/vamp/ga/ga_on_runner.jsonl \
   --wstats ~/vamp/ga/ga_on_wstats.jsonl --probe ~/vamp/ga/ga_on_probe_full.jsonl
 ```
 raw 결과: jpserver `asplos_paper/solab_testbed/results/ga_2026-09-05/` (17 files, 80 KB).
+
+## 6. 리뷰 반영 (Codex 2026-09-05 → 후속 커밋)
+
+리뷰 분류 기준(현재 실험을 막는 문제 / 비교를 왜곡하는 문제 / 나중에 해도 되는 개선)에 따라 처리했다.
+범위는 **실험용 시스템**(모델 1, GPU 2, migration 세션 1, 목적지 고정, metadata 관리 주체 1, 전송 한 건씩, 고정 용량, cancellation 미지원·오류 시 중단)이다.
+
+| 지적 | 확인 | 처리 | 검증 |
+| --- | --- | --- | --- |
+| mailbox: 취소된 Future 실행 → lease 누수 + `InvalidStateError`가 scheduler step으로 전파 | **재현** (실제 `CPUOffloadingManager`, s1) | `_drain_mailbox`가 `set_running_or_notify_cancel()` 실패 시 명령을 건너뜀(`mailbox_cancelled` 카운터) | `test_cancelled_mailbox_command_is_skipped_without_leak` |
+| mailbox: 요청 없는 gap에서 drain 정지 → 사전 publication 불가 | 코드상 확인(drain이 lookup/take_events에만 있음) | ① listener가 `on_blocks_ready`(owner thread) 안에서 `acquire_export_lease`를 **동기 호출**해 pin을 확보하는 경로를 공식화 ② `prepare_store`/`complete_store` 끝에서도 drain | `test_listener_acquires_lease_synchronously_in_ready_callback` |
+| trace: finish 시점에 `response_done`을 써서 뒤따르는 usage가 저장본에서 빠짐 | 코드상 확인 + **실측**: Dynamo 0.5.0은 usage를 모든 chunk에 실어 보냄(usage-only chunk 없음) | ① runner가 **어떤 chunk에 실린 usage든** 기록 ② HTTP backend가 finish chunk를 보류하고 stream 종료 시 finish 시각을 가진 단일 DONE을 방출(trailing usage가 먼저 처리됨) | `test_usage_is_in_the_written_response_done_for_both_stream_styles` — **저장된 이벤트**를 검사(openai/dynamo 두 스타일) |
+| CXL: fence 실패가 DONE으로 남음 | 코드상 확인(COMPLETED 발행 후 fence, 예외 삼켜짐) | fence를 **COMPLETED 이전**에 실행, 실패 시 FAILED(proof 없음) | `test_fence_failure_is_failed_not_done` |
+| CXL: read 전 refresh/flush 경로 없음 | 코드상 확인(의도된 fail-closed였으나 read 쪽엔 규약이 없었음) | `refresh` callable 도입; 없으면 read job FAILED(emulated provider만 예외) | `test_read_without_refresh_fails_closed_on_non_emulated_provider` |
+| shared-store: 용량이 인스턴스별 → 예산 초과 예약 | **재현**(2-block 예산에 3 block) | **단일 관리자 모드**: 디렉토리 레코드에 owner 기록, 다른 인스턴스는 `read_only` → `REJECTED_READ_ONLY` | `test_second_instance_is_read_only_no_double_accounting` |
+| shared-store: 다른 인스턴스의 READY 항목 읽기 거부 | 코드상 확인(`FOREIGN_ENTRY_LOCK_UNAVAILABLE`, 의도된 fail-closed) | **미해결·설계 방향만**: 단일 관리자가 (offset, nbytes, generation, checksum)을 우리 제어 채널로 전달하고 reader는 lock 없이 generation/checksum 검증 후 읽기, 관리자는 reader 완료 전 slot을 해제하지 않음. G-F 착수 시 구현 | — |
+| G-B "고정" 미충족; receipt ≠ targeting | 동의 | 상태를 "headroom 계측 진단 완료 / 고정 배치 미검증"으로 정정; targeting은 단일-worker endpoint 또는 experiment router로 | gate-results §G-B |
+| 보고 문구(36/36, 13배, affinity 없음) | 동의 | gate-results·solab README·메모리 문구 정정 | — |
+
+미검증으로 남는 것: 실제 CXL library에서의 fence/refresh 동작(G-E), 단일 관리자 cross-host read 경로(G-F), export lease → bridge gather → network 전송 → destination import의 end-to-end(G-D).

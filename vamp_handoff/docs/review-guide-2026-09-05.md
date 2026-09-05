@@ -49,8 +49,8 @@ python -S -m unittest discover -s vamp_handoff/tests            # 49 (torch 없�
 
 ### `solab/worker_vamp.sh` (런처)
 - `PYTHONPATH=~/vamp/vamp_handoff:~/vamp/probe` 로 `vamp_cxl`과 `vamp_probe`를 노출. 설치본 site-packages 미변경.
-- `--kv-transfer-config`만 사용(`--connector` 미지정). 설치본에는 patch7(`--connector` default None)이 필요 — 이 커밋에 없음,
-  `patches/dynamo-solab.patch` 갱신 여부는 **미확인 항목**(아래 §4).
+- `--kv-transfer-config`만 사용(`--connector` 미지정). 설치본에는 patch7(`--connector` default None)이 필요하며,
+  `patches/dynamo-solab.patch`에 이미 포함되어 있다(§4.1에서 확인).
 - `cpu_bytes_to_use=64GiB`, `block_size_factor=2`, `eviction_policy=lru`.
 
 ### `solab/ga_cell.sh` (cell 절차)

@@ -1,0 +1,4 @@
+# Historical references are byte-exact captures, not editable implementation.
+# This scoped exclusion does not exclude new Python code or handoff prose.
+[files]
+extend-exclude = ["**/*.ref"]

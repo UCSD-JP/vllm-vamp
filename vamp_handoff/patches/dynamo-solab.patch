@@ -1,0 +1,95 @@
+--- a/components/backends/vllm/src/dynamo/vllm/args.py
++++ b/components/backends/vllm/src/dynamo/vllm/args.py
+@@ -9,7 +9,7 @@
+ from vllm.config import KVTransferConfig
+ from vllm.distributed.kv_events import KVEventsConfig
+ from vllm.engine.arg_utils import AsyncEngineArgs
+-from vllm.utils import FlexibleArgumentParser
++from vllm.utils.argparse_utils import FlexibleArgumentParser
+ 
+ from dynamo._core import get_reasoning_parser_names, get_tool_parser_names
+ 
+@@ -96,7 +96,7 @@
+     parser.add_argument(
+         "--connector",
+         nargs="*",
+-        default=["nixl"],
++        default=None,
+         help="List of connectors to use in order (e.g., --connector nixl lmcache). "
+         "Options: nixl, lmcache, kvbm, null, none. Default: nixl. Order will be preserved in MultiConnector.",
+     )
+@@ -352,7 +352,7 @@
+             setattr(config.engine_args, key, value)
+             logger.debug(f" engine_args.{key} = {value}")
+         else:
+-            raise ValueError(f"{key} not found in AsyncEngineArgs from vLLM.")
++            logger.warning(f"{key} not found in AsyncEngineArgs (vLLM 0.19 drift) — skipped")
+ 
+ 
+ def set_side_channel_host_and_port(side_channel_port: int):
+--- a/components/backends/vllm/src/dynamo/vllm/main.py
++++ b/components/backends/vllm/src/dynamo/vllm/main.py
+@@ -122,7 +122,7 @@
+         vllm_config=vllm_config,
+         usage_context=usage_context,
+         stat_loggers=factory,
+-        disable_log_requests=engine_args.disable_log_requests,
++        enable_log_requests=getattr(engine_args, "enable_log_requests", False),
+         disable_log_stats=engine_args.disable_log_stats,
+     )
+     if ENABLE_LMCACHE:
+--- a/components/backends/vllm/src/dynamo/vllm/protocol.py
++++ b/components/backends/vllm/src/dynamo/vllm/protocol.py
+@@ -5,7 +5,8 @@
+ 
+ from pydantic import BaseModel, ConfigDict
+ from vllm.outputs import CompletionOutput
+-from vllm.sequence import PromptLogprobs, RequestMetrics
++from vllm.logprobs import PromptLogprobs
++from typing import Any as RequestMetrics
+ 
+ 
+ class MyRequestOutput(BaseModel):
+--- a/components/backends/vllm/src/dynamo/vllm/publisher.py
++++ b/components/backends/vllm/src/dynamo/vllm/publisher.py
+@@ -25,7 +25,9 @@
+         self,
+         scheduler_stats: Optional[SchedulerStats],
+         iteration_stats: Optional[IterationStats],
++        mm_cache_stats=None,
+         engine_idx: int = 0,
++        **kwargs,
+     ):
+         pass
+ 
+@@ -62,11 +64,30 @@
+         self,
+         scheduler_stats: SchedulerStats,
+         iteration_stats: Optional[IterationStats],
++        mm_cache_stats=None,
+         engine_idx: int = 0,
++        **kwargs,
+     ):
+         # request_total_slots and kv_total_blocks are properties of model + gpu
+         # we should only publish them once, not every metric update
+         # they should be part of some runtime metadata tied to MDC or put in etcd ?
++        # VAMP sidecar (patch #6): vLLM SchedulerStats 원본을 파일로 덤프 (kvstats gauge dead-code 우회)
++        try:
++            import json as _json, time as _time, os as _os
++            _p = _os.environ.get("VAMP_STATS_FILE")
++            if _p and scheduler_stats is not None:
++                _c = getattr(scheduler_stats, "connector_prefix_cache_stats", None)
++                with open(_p, "a") as _f:
++                    _f.write(_json.dumps({"ts": _time.time(),
++                        "hits": scheduler_stats.prefix_cache_stats.hits,
++                        "queries": scheduler_stats.prefix_cache_stats.queries,
++                        "usage": scheduler_stats.kv_cache_usage,
++                        "running": scheduler_stats.num_running_reqs,
++                        "waiting": scheduler_stats.num_waiting_reqs,
++                        "conn_hits": getattr(_c, "hits", None),
++                        "conn_queries": getattr(_c, "queries", None)}) + "\n")
++        except Exception:
++            pass
+         hit_rate = 0
+         if scheduler_stats.prefix_cache_stats.queries > 0:
+             hit_rate = (

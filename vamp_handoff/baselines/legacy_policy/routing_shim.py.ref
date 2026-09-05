@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""VAMP routing shim — OpenAI-compatible proxy that routes to 2 vLLM workers (LO/QO/SRR) + logs trace.
+SWE-agent(arm A)/ADK가 직접 worker로 못 가게, 이 shim의 api_base를 가리킴 → routing 결정/로깅을 우리가 쥠.
+task_id는 요청 본문의 첫 user message 내 'INSTANCE[<id>]' 마커 또는 X-Task-Id 헤더에서 추출(LO owner용).
+로그 schema: ts,task_id,selected_worker,route_policy,route_reason,prompt_tokens_est,ttft_ms,latency_ms,status
+usage: routing_shim.py --port 9000 --workers http://127.0.0.1:18001/v1,http://127.0.0.1:18002/v1 --policy QO --log /tmp/shim.csv
+"""
+import argparse, asyncio, csv, json, os, re, time, threading
+from aiohttp import web, ClientSession, ClientTimeout
+
+P = argparse.ArgumentParser()
+P.add_argument("--port", type=int, default=9000)
+P.add_argument("--workers", default="http://127.0.0.1:18001/v1,http://127.0.0.1:18002/v1")
+P.add_argument("--policy", default="QO", choices=["LO","SRR","QO","LS","CASS"])
+P.add_argument("--spill-trigger", type=int, default=8)
+P.add_argument("--log", default="/tmp/shim.csv")
+# CASS v0 (spec: docs/2026-08-03-cass-v0-implementation-spec.md). 기존 정책 경로는 무변경.
+P.add_argument("--kv-pool-tokens", type=int, default=281136, help="worker GPU KV pool tokens (boot log 실측)")
+P.add_argument("--cpu-buf-tokens", type=int, default=0, help="CPU offload buffer tokens (OFF cell=0)")
+P.add_argument("--tau-svc", type=float, default=1.4)
+P.add_argument("--r-prefill", type=float, default=9000.0)
+P.add_argument("--r-restore", type=float, default=0.2e9)
+P.add_argument("--cass-trace", default="/tmp/cass_trace.jsonl", help="decision trace JSONL")
+P.add_argument("--poll-s", type=float, default=1.0, help="worker /metrics polling 주기 (실패시 inflight만으로 degrade)")
+# E3 hardening: payload capture + vLLM-safe normalization (둘 다 기본 off → E1/기존 호환)
+P.add_argument("--dump-dir", default="", help="set → 들어오는 요청 raw payload + key 요약 저장 (E3.0 capture)")
+P.add_argument("--dump-n", type=int, default=4, help="raw 파일로 저장할 요청 개수 (key 요약은 전부)")
+P.add_argument("--normalize", action="store_true", help="요청 본문을 vLLM-safe field subset으로 축소 후 forward (E3.2)")
+args = P.parse_args()
+WORKERS = args.workers.split(",")
+
+# E3.2: vLLM 0.22 chat/completions에 안전한 field만 통과. 나머지(tools/tool_choice/
+# parallel_tool_calls/response_format/metadata/extra_body/reasoning/modalities 등)는 제거.
+SAFE_FIELDS = ["model","messages","max_tokens","max_completion_tokens","temperature",
+               "top_p","stream","stream_options","n","stop","seed",
+               "frequency_penalty","presence_penalty","logprobs","top_logprobs"]
+_DUMP_N = [0]
+if args.dump_dir:
+    os.makedirs(args.dump_dir, exist_ok=True)
+
+def _dump(raw, body):
+    with LOCK:
+        i = _DUMP_N[0]; _DUMP_N[0] += 1
+    if i < args.dump_n:
+        with open(os.path.join(args.dump_dir, f"payload_{i}.json"), "wb") as f:
+            f.write(raw)
+    msgs = body.get("messages", []) if isinstance(body, dict) else []
+    summary = {
+        "i": i, "keys": sorted(body.keys()) if isinstance(body, dict) else [],
+        "has_tools": "tools" in body, "n_tools": len(body.get("tools") or []),
+        "tool_choice": body.get("tool_choice"),
+        "parallel_tool_calls": body.get("parallel_tool_calls"),
+        "response_format": body.get("response_format"),
+        "stream": body.get("stream"), "has_extra_body": "extra_body" in body,
+        "n_msgs": len(msgs), "roles": [m.get("role") for m in msgs],
+        "content_types": [type(m.get("content")).__name__ for m in msgs],
+    }
+    with LOCK:
+        with open(os.path.join(args.dump_dir, "keys.jsonl"), "a") as f:
+            f.write(json.dumps(summary) + "\n")
+
+LOGF = open(args.log, "a", newline=""); LOGW = csv.writer(LOGF)
+if LOGF.tell() == 0:
+    LOGW.writerow(["ts","task_id","selected_worker","route_policy","route_reason",
+                   "prompt_chars","prompt_tokens","completion_tokens","ttft_ms","latency_ms","status"])
+LOCK = threading.Lock()
+
+def parse_usage(raw):
+    """응답 body(JSON/SSE)에서 usage 추출 → (ptok, ctok, cached, cached_observed).
+    cached_observed=False는 필드 부재(=feedback 없음)와 실측 0을 구분 (G9)."""
+    try:
+        s = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else raw
+        import re as _re
+        pts = _re.findall(r'"prompt_tokens"\s*:\s*(\d+)', s)
+        cts = _re.findall(r'"completion_tokens"\s*:\s*(\d+)', s)
+        cas = _re.findall(r'"cached_tokens"\s*:\s*(\d+)', s)
+        return (int(pts[-1]) if pts else 0, int(cts[-1]) if cts else 0,
+                int(cas[-1]) if cas else 0, bool(cas))
+    except Exception:
+        return (0, 0, 0, False)
+
+class Router:
+    def __init__(s): s.inflight={w:0 for w in WORKERS}; s.rr=0; s.owner={}; s.owner_rr=0; s.lock=threading.Lock()
+    def pick(s, task_id):
+        with s.lock:
+            if task_id and task_id not in s.owner:
+                # balanced: 첫 등장 순서로 round-robin (이전 hash(task_id)%2 는 N 작을 때 load 불균형 → LO movement artifact)
+                s.owner[task_id]=WORKERS[s.owner_rr%len(WORKERS)]; s.owner_rr+=1
+            own=s.owner.get(task_id, WORKERS[0])
+            if args.policy=="LO" or len(WORKERS)==1: return own,"LO"
+            if args.policy=="SRR": w=WORKERS[s.rr%len(WORKERS)]; s.rr+=1; return w,"SRR"
+            if args.policy=="QO":
+                m=min(s.inflight.values()); c=[w for w in WORKERS if s.inflight[w]==m]
+                return (own if own in c else c[0]), f"QO(min={m})"
+            if args.policy=="LS":
+                if s.inflight[own]>=args.spill_trigger:
+                    o=min((w for w in WORKERS if w!=own),key=lambda x:s.inflight[x]); return o,"spill"
+                return own,"follow"
+    def acq(s,w):
+        with s.lock: s.inflight[w]+=1
+    def rel(s,w):
+        with s.lock: s.inflight[w]-=1
+R=Router()
+
+# ---- CASS v0 wiring (policy=CASS일 때만 활성; legacy 경로 무변경) ----
+CP=None; TRACEF=None
+if args.policy=="CASS":
+    from cass_policy import CassConfig, CassPolicy
+    CP=CassPolicy(CassConfig(workers=list(WORKERS), pool_tok=args.kv_pool_tokens,
+        cpubuf_tok=args.cpu_buf_tokens, mode="CASS", tau_svc=args.tau_svc,
+        r_prefill=args.r_prefill, r_restore=args.r_restore, poll_s=args.poll_s))
+    TRACEF=open(args.cass_trace,"a")
+    TRACEF.write(json.dumps({"meta":CP.snapshot(),"ts":time.time()})+"\n"); TRACEF.flush()
+
+def _trace(task_id,d,realized):
+    if TRACEF is None: return
+    with LOCK:
+        TRACEF.write(json.dumps({"ts":round(time.time(),3),"task_id":task_id,
+            "chosen":d.worker,"reason":d.reason,"miss_est":d.miss_est,
+            "cands":[c.as_dict() for c in d.candidates],
+            "cf_failed":d.counterfactual_failed,"prefix_init":d.prefix_init_heuristic,
+            "realized":realized})+"\n"); TRACEF.flush()
+
+async def _poller(app):
+    """worker /metrics에서 running/waiting 폴링 → CP 갱신. 실패=무시(inflight-only degrade)."""
+    import re as _re
+    while True:
+        for w in WORKERS:
+            try:
+                base=w.rstrip("/");
+                url=(base[:-3] if base.endswith("/v1") else base)+"/metrics"
+                async with ClientSession(timeout=ClientTimeout(total=2)) as s:
+                    async with s.get(url) as r:
+                        txt=await r.text()
+                run=_re.findall(r'vllm:num_requests_running(?:\{[^}]*\})?\s+([0-9.]+)',txt)
+                wai=_re.findall(r'vllm:num_requests_waiting(?:\{[^}]*\})?\s+([0-9.]+)',txt)
+                if run: CP.update_worker_metrics(w,int(float(run[-1])),int(float(wai[-1])) if wai else 0)
+            except Exception: pass
+        await asyncio.sleep(args.poll_s)
+
+def msg_text(content):
+    """content가 str이거나 OpenAI content-part list([{"type":"text","text":...}, {"type":"image_url",...}])인 경우 모두 text만 추출."""
+    if isinstance(content, str): return content
+    if isinstance(content, list):
+        out=[]
+        for part in content:
+            if isinstance(part, dict) and part.get("type")=="text":
+                out.append(part.get("text","") or "")
+        return "".join(out)
+    return ""
+
+def extract_task_id(body):
+    try:
+        for m in body.get("messages",[]):
+            mt=re.search(r"(?:INSTANCE|PROJECT)\[([^\]]+)\]", msg_text(m.get("content","")))  # PROJECT=lgaccum 마커 (P0-1 백업 경로)
+            if mt: return mt.group(1)
+    except Exception: pass
+    return ""
+
+async def handle(req):
+    raw=await req.read()
+    try: body=json.loads(raw)
+    except Exception: body={}
+    if args.dump_dir: _dump(raw, body)            # E3.0: capture
+    if args.normalize and isinstance(body, dict):  # E3.2: vLLM-safe subset
+        body={k:body[k] for k in SAFE_FIELDS if k in body}
+        raw=json.dumps(body).encode()
+    task_id=req.headers.get("X-Task-Id","") or extract_task_id(body)
+    prompt_chars=sum(len(msg_text(m.get("content",""))) for m in body.get("messages",[]))
+    if CP is not None:
+        with LOCK: d=CP.decide(task_id,prompt_chars); CP.on_admit(d)
+        w,reason=d.worker,d.reason
+    else:
+        d=None; w,reason=R.pick(task_id); R.acq(w)
+    url=w.rstrip("/")+"/chat/completions"
+    t0=time.time(); ttft=None; status=0; out=bytearray()
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=1800)) as sess:
+            async with sess.post(url, data=raw, headers={"Content-Type":"application/json"}) as resp:
+                status=resp.status
+                stream = body.get("stream", False)
+                if stream:
+                    sr=web.StreamResponse(status=status, headers={"Content-Type":"text/event-stream"})
+                    await sr.prepare(req)
+                    tail=bytearray()
+                    async for chunk in resp.content.iter_any():
+                        if ttft is None: ttft=(time.time()-t0)*1000
+                        await sr.write(chunk)
+                        tail+=chunk; tail=tail[-4000:]  # 최종 청크의 usage 추출용
+                    await sr.write_eof()
+                    pt,ct,ca,cao=parse_usage(tail)
+                    lat=(time.time()-t0)*1000
+                    if CP is not None:
+                        with LOCK: CP.on_response(task_id,w,pt,ca,d)
+                        _trace(task_id,d,{"ttft_ms":round(ttft or 0),"e2e_ms":round(lat),
+                            "prompt_tokens":pt,"cached_tokens":ca,
+                            "cached_tokens_observed":cao,"usage_observed":pt>0,"status":status})
+                    else: R.rel(w)
+                    _log(task_id,w,reason,prompt_chars,pt,ct,ttft,lat,status); return sr
+                else:
+                    data=await resp.read(); ttft=(time.time()-t0)*1000
+                    pt,ct,ca,cao=parse_usage(data)
+                    lat=(time.time()-t0)*1000
+                    if CP is not None:
+                        with LOCK: CP.on_response(task_id,w,pt,ca,d)
+                        _trace(task_id,d,{"ttft_ms":round(ttft),"e2e_ms":round(lat),
+                            "prompt_tokens":pt,"cached_tokens":ca,
+                            "cached_tokens_observed":cao,"usage_observed":pt>0,"status":status})
+                    else: R.rel(w)
+                    _log(task_id,w,reason,prompt_chars,pt,ct,ttft,lat,status)
+                    return web.Response(body=data, status=status, content_type="application/json")
+    except Exception as e:
+        if CP is not None:
+            with LOCK: CP.on_error(w,d)
+            _trace(task_id,d,{"status":f"ERR:{type(e).__name__}"})
+        else: R.rel(w)
+        _log(task_id,w,reason,prompt_chars,0,0,ttft,(time.time()-t0)*1000,f"ERR:{type(e).__name__}")
+        return web.Response(status=502, text=str(e))
+
+def _log(task_id,w,reason,pc,pt,ct,ttft,lat,status):
+    with LOCK:
+        LOGW.writerow([f"{time.time():.1f}",task_id,w,args.policy,reason,pc,pt,ct,
+                       f"{ttft:.0f}" if ttft else "",f"{lat:.0f}",status]); LOGF.flush()
+
+async def models(req):  # SWE-agent/litellm이 /v1/models 조회할 수 있음 → 첫 worker로 프록시
+    async with ClientSession(timeout=ClientTimeout(total=10)) as sess:
+        async with sess.get(WORKERS[0].rstrip("/")+"/models") as r:
+            return web.Response(body=await r.read(), status=r.status, content_type="application/json")
+
+app=web.Application(client_max_size=1024**3)
+app.router.add_post("/v1/chat/completions", handle)
+app.router.add_post("/chat/completions", handle)
+app.router.add_get("/v1/models", models)
+app.router.add_get("/models", models)
+if CP is not None:
+    async def _start_poller(app_):
+        app_["poller"]=asyncio.get_event_loop().create_task(_poller(app_))
+    app.on_startup.append(_start_poller)
+print(f"[router] policy={args.policy} workers={WORKERS} port={args.port} log={args.log}"
+      + (f" cass_trace={args.cass_trace} pool_tok={args.kv_pool_tokens} cpubuf_tok={args.cpu_buf_tokens}" if CP is not None else ""), flush=True)
+web.run_app(app, host="127.0.0.1", port=args.port, print=None)

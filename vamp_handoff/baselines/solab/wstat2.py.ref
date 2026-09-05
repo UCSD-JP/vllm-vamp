@@ -1,0 +1,14 @@
+import json,sys
+h=q=ch=cq=n=0; maxu=0.0; maxrun=0; maxwait=0
+for line in open(sys.argv[1]):
+    try: d=json.loads(line)
+    except: continue
+    n+=1
+    h+=d.get("hits") or 0;      q+=d.get("queries") or 0
+    ch+=d.get("conn_hits") or 0; cq+=d.get("conn_queries") or 0
+    maxu=max(maxu, d.get("usage") or 0.0)
+    maxrun=max(maxrun, d.get("running") or 0); maxwait=max(maxwait, d.get("waiting") or 0)
+print(f"records={n}")
+print(f"  GPU prefix : hits={h:,} queries={q:,} rate={100*h/q if q else 0:.1f}%")
+print(f"  CONNECTOR  : hits={ch:,} queries={cq:,} rate={100*ch/cq if cq else 0:.1f}%   <- DRAM tier")
+print(f"  peak_kv_usage={maxu:.3f}  peak_running={maxrun}  peak_waiting={maxwait}")

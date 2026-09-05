@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""CASS v0 — cost-aware serving scheduler policy module (pure; no I/O/network/clock).
+
+Spec: docs/2026-08-03-cass-v0-implementation-spec.md (rev2).
+- Unified mode: "LO" | "QO" | "SRR" | "CASS" — LO/QO/SRR reproduce the legacy
+  experiment-router semantics exactly (M7 equivalence gate); CASS = full cost model.
+- Naming (rev2): committed_miss_tokens(관측) / provisional_miss_tokens(예측) /
+  inflight_requests / worker_load_snapshot / task_residency_ledger / eviction_clock_tokens.
+- provisional_miss_tokens is not an observed KV allocation. It is a conservative
+  decision-time estimate used to avoid underestimating eviction pressure during
+  bursts before responses return.
+"""
+from __future__ import annotations
+import time
+from dataclasses import dataclass, field
+
+
+@dataclass
+class CassConfig:
+    workers: list                      # worker id 목록 (endpoint 문자열)
+    pool_tok: int = 281136             # GPU KV pool tokens (boot log 실측 주입)
+    cpubuf_tok: int = 0                # CPU offload buffer tokens (OFF cell=0)
+    mode: str = "CASS"                # "LO" | "QO" | "SRR" | "CASS"
+    tau_svc: float = 1.4               # s/req (C0 calibration으로 교체)
+    r_prefill: float = 9000.0          # tok/s (C0)
+    r_restore: float = 0.2e9           # bytes/s (R_restore_eff_live)
+    bytes_per_tok: int = 96 * 1024     # Qwen3-30B-A3B bf16 KV
+    gamma_gpu: float = 1.0
+    gamma_cpu: float = 1.0
+    eps: float = 0.05
+    min_obs_for_cost: int = 1
+    poll_s: float = 1.0
+    provisional_enabled: bool = True   # mock M3 대조용 (실환경 항상 True)
+
+
+@dataclass
+class Candidate:
+    worker: str
+    q: int = 0
+    gpu_res: int = 0
+    cpu_res: int = 0
+    miss: int = 0
+    t_queue: float = 0.0
+    t_prefill: float = 0.0
+    t_restore: float = 0.0
+    t_est: float = 0.0
+
+    def as_dict(self):
+        return {"w": self.worker, "q": self.q, "gpu_res": self.gpu_res,
+                "cpu_res": self.cpu_res, "miss": self.miss,
+                "T_queue": round(self.t_queue, 4), "T_prefill": round(self.t_prefill, 4),
+                "T_restore": round(self.t_restore, 4), "T_est": round(self.t_est, 4)}
+
+
+@dataclass
+class Decision:
+    worker: str
+    reason: str            # "min_cost"|"tie_resident"|"fallback_lo_new_task"|mode 이름(baseline)
+    candidates: list
+    miss_est: int
+    counterfactual_failed: bool = False
+    prefix_init_heuristic: bool = False
+
+
+@dataclass
+class _Ledger:
+    last_w: str = ""
+    prefix_tok: int = 0
+    clock_at_touch: int = 0
+    evicted_at: int = -1      # -1 = 미기록
+    n_obs: int = 0
+    last_ptok: int = 0
+
+
+@dataclass
+class _Snap:
+    running: int = 0
+    waiting: int = 0
+    ts: float = 0.0
+
+
+class CassPolicy:
+    def __init__(self, cfg: CassConfig, now_fn=time.monotonic):
+        self.cfg = cfg
+        self.now = now_fn
+        self.committed_miss_tokens = {w: 0 for w in cfg.workers}
+        self.provisional_miss_tokens = {w: 0 for w in cfg.workers}
+        self.inflight_requests = {w: 0 for w in cfg.workers}
+        self.worker_load_snapshot = {}
+        self.task_residency_ledger = {}
+        # legacy 동치용 상태 (routing_shim.Router와 동일 의미론)
+        self._owner = {}
+        self._owner_rr = 0
+        self._srr = 0
+
+    # ---------- 내부 ----------
+    def eviction_clock_tokens(self, w) -> int:
+        c = self.committed_miss_tokens[w]
+        if self.cfg.provisional_enabled:
+            c += self.provisional_miss_tokens[w]
+        return c
+
+    def _owner_of(self, task_id: str) -> str:
+        # legacy Router와 동일: 첫 등장 순서 round-robin, sticky. 모든 mode에서 배정(동치 유지).
+        if task_id and task_id not in self._owner:
+            self._owner[task_id] = self.cfg.workers[self._owner_rr % len(self.cfg.workers)]
+            self._owner_rr += 1
+        return self._owner.get(task_id, self.cfg.workers[0])
+
+    def _cost_candidates(self, task_id: str, ptok_est: int):
+        """CASS 비용 후보 계산 (모든 mode에서 counterfactual로도 사용)."""
+        L = self.task_residency_ledger.get(task_id)
+        now = self.now()
+        cands, by_w = [], {}
+        for w in self.cfg.workers:
+            clock_w = self.eviction_clock_tokens(w)
+            snap = self.worker_load_snapshot.get(w)
+            fresh = snap is not None and (now - snap.ts) < 2 * self.cfg.poll_s
+            q = max(self.inflight_requests[w], snap.running + snap.waiting) if fresh \
+                else self.inflight_requests[w]
+            gpu_res = cpu_res = 0
+            if L and L.last_w == w and L.prefix_tok > 0:
+                if clock_w - L.clock_at_touch < self.cfg.gamma_gpu * self.cfg.pool_tok:
+                    gpu_res = min(L.prefix_tok, ptok_est)
+                elif (self.cfg.cpubuf_tok > 0 and L.evicted_at >= 0
+                      and clock_w - L.evicted_at < self.cfg.gamma_cpu * self.cfg.cpubuf_tok):
+                    cpu_res = min(L.prefix_tok, ptok_est)
+            miss = max(ptok_est - gpu_res - cpu_res, 0)
+            c = Candidate(w, q, gpu_res, cpu_res, miss,
+                          q * self.cfg.tau_svc,
+                          miss / self.cfg.r_prefill,
+                          cpu_res * self.cfg.bytes_per_tok / self.cfg.r_restore)
+            c.t_est = c.t_queue + c.t_prefill + c.t_restore
+            cands.append(c); by_w[w] = c
+        # [E-evict] 기존 last_w의 gpu_res가 처음 0이 된 순간 기록
+        if L and L.last_w and L.evicted_at < 0 and L.n_obs > 0:
+            lw = by_w.get(L.last_w)
+            if lw is not None and lw.gpu_res == 0:
+                L.evicted_at = self.eviction_clock_tokens(L.last_w)
+        return cands, by_w
+
+    # ---------- 공개 API ----------
+    def decide(self, task_id: str, prompt_chars: int) -> Decision:
+        cfg = self.cfg
+        L = self.task_residency_ledger.get(task_id)
+        ptok_est = L.last_ptok if (L and L.last_ptok > 0) else max(64, prompt_chars // 4)
+        owner = self._owner_of(task_id)   # 모든 mode에서 배정 (legacy 동치)
+
+        # ----- baseline modes: 결정층(legacy 의미론) + 기록층(counterfactual) 분리 -----
+        if cfg.mode in ("LO", "QO", "SRR"):
+            if cfg.mode == "LO" or len(cfg.workers) == 1:
+                w = owner
+            elif cfg.mode == "SRR":
+                w = cfg.workers[self._srr % len(cfg.workers)]; self._srr += 1
+            else:  # QO — legacy: min inflight, 동률 집합에 owner 있으면 owner 아니면 첫 번째
+                m = min(self.inflight_requests.values())
+                tie = [w_ for w_ in cfg.workers if self.inflight_requests[w_] == m]
+                w = owner if owner in tie else tie[0]
+            cands, cf_failed = [], False
+            try:
+                cands, by_w = self._cost_candidates(task_id, ptok_est)
+                miss_est = by_w[w].miss
+            except Exception:
+                cf_failed, miss_est = True, ptok_est
+            return Decision(w, cfg.mode, cands, miss_est, counterfactual_failed=cf_failed)
+
+        # ----- CASS mode -----
+        if L is None or L.n_obs < cfg.min_obs_for_cost:
+            # [E1] uncertainty fallback → LO
+            return Decision(owner, "fallback_lo_new_task", [], ptok_est)
+        cands, by_w = self._cost_candidates(task_id, ptok_est)
+        best = min(cands, key=lambda c: c.t_est)
+        sticky = L.last_w if L.last_w else owner
+        sticky_cand = by_w[sticky]
+        if sticky_cand.t_est <= best.t_est * (1 + cfg.eps):
+            return Decision(sticky, "tie_resident", cands, sticky_cand.miss)
+        return Decision(best.worker, "min_cost", cands, best.miss)
+
+    def on_admit(self, d: Decision) -> None:
+        self.provisional_miss_tokens[d.worker] += d.miss_est
+        self.inflight_requests[d.worker] += 1
+
+    def on_response(self, task_id: str, worker: str, prompt_tokens: int,
+                    cached_tokens: int, d: Decision) -> None:
+        self.provisional_miss_tokens[worker] = max(
+            0, self.provisional_miss_tokens[worker] - d.miss_est)
+        self.inflight_requests[worker] = max(0, self.inflight_requests[worker] - 1)
+        self.committed_miss_tokens[worker] += max(prompt_tokens - cached_tokens, 0)
+        L = self.task_residency_ledger.setdefault(task_id, _Ledger())
+        if L.n_obs == 0 and cached_tokens == 0:
+            L.prefix_tok = int(0.8 * prompt_tokens)
+            d.prefix_init_heuristic = True
+        else:
+            L.prefix_tok = max(L.prefix_tok, cached_tokens)
+        L.last_w = worker
+        L.clock_at_touch = self.eviction_clock_tokens(worker)
+        L.evicted_at = -1          # 재상주
+        L.n_obs += 1
+        L.last_ptok = prompt_tokens
+
+    def on_error(self, worker: str, d: Decision) -> None:
+        self.provisional_miss_tokens[worker] = max(
+            0, self.provisional_miss_tokens[worker] - d.miss_est)
+        self.inflight_requests[worker] = max(0, self.inflight_requests[worker] - 1)
+
+    def update_worker_metrics(self, worker: str, running: int, waiting: int) -> None:
+        self.worker_load_snapshot[worker] = _Snap(running, waiting, self.now())
+
+    def snapshot(self) -> dict:
+        return {"mode": self.cfg.mode, "pool_tok": self.cfg.pool_tok,
+                "cpubuf_tok": self.cfg.cpubuf_tok,
+                "coeffs": {"tau_svc": self.cfg.tau_svc, "r_prefill": self.cfg.r_prefill,
+                           "r_restore": self.cfg.r_restore, "eps": self.cfg.eps,
+                           "gamma_gpu": self.cfg.gamma_gpu, "gamma_cpu": self.cfg.gamma_cpu},
+                "committed": dict(self.committed_miss_tokens),
+                "provisional": dict(self.provisional_miss_tokens),
+                "inflight": dict(self.inflight_requests),
+                "n_tasks": len(self.task_residency_ledger),
+                "single_residency_assumption": True}

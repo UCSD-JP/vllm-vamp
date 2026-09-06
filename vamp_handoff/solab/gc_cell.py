@@ -61,13 +61,19 @@ if args.hook:
     import subprocess
     hook_proc = subprocess.Popen(args.hook, shell=True)
 arrival = t0 + args.gap_s
-if time.time() < arrival:
-    time.sleep(arrival - time.time())
+hook_done_ts = None
+while time.time() < arrival:
+    # record the hook's own completion time even when it finishes before the arrival
+    if hook_proc is not None and hook_done_ts is None and hook_proc.poll() is not None:
+        hook_done_ts = time.time()
+    time.sleep(min(0.05, max(0.0, arrival - time.time())))
 arrival_ts = time.time()
 hook_rc, hook_wall = None, None
 if hook_proc is not None:
     hook_rc = hook_proc.wait()
-    hook_wall = round(time.time() - t0, 3)
+    if hook_done_ts is None:
+        hook_done_ts = time.time()
+    hook_wall = round(hook_done_ts - t0, 3)   # actual hook duration (not max(hook, gap))
     print(json.dumps({"hook": args.hook, "rc": hook_rc, "seconds": hook_wall, "started_at": "t0"}), flush=True)
     if hook_rc != 0:
         # spec §9: a failed migration hook fails the cell; never run B on an unverified import

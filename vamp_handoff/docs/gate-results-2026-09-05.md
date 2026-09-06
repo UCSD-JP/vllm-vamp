@@ -322,10 +322,22 @@ A sidecar: connector 0/13,882(turn 0 cold), GPU 66.5%. 5/5 marker 정답.
 
 관측(주장 아님): **정책이 써야 하는 준비 비용은 hook 전체 벽시계 7.3 s**(gather 1.5 + CXL write 0.23 + fence 0.17 + sha256 1.6 + 제어/nudge + B refresh 0.17 + sha256 2.5 + 복사 0.80)이다. "1.4 s"는 그중 write/fence/refresh/복사 4단계의 합일 뿐이며 이동 비용 전체가 아니다. TCP prototype hook은 26.8 s. nudge 2건은 여전히 필요(idle EngineCore). 벽시계 값이며 통제된 성능 비교가 아니다.
 
+## 실패 주입·정리 게이트 (2026-09-06) — **PASS** (`fail_wrongkey2`, `fail_checksum2`)
+
+절차: `gate_cell.sh` → `gc_cell.py --hook "gf_hook.py --inject …"`; hook rc≠0 → `cell_invalid` 기록·B 턴 생략·rc 1 → `CELL_INVALID`(실패 전파). 정리 순서(controller-serialized): B cleanup(import) → A cleanup(export: `lock_free → destroy → payload_free → shfree`, lease release 게시) → A nudge → 양쪽 status 검증 = `CLEANUP_GATE`.
+
+| 셀 | 주입 | 관측 | 정리 결과 |
+| --- | --- | --- | --- |
+| `fail_wrongkey2` | B prepare에 없는 key | A export 801 blocks 2,099,773,440 B → B "not found" | A `cxl_freed` payload+hashes, leases 0/0, **gate ok**, hook 4.1 s |
+| `fail_checksum2` | reservation 후 기대 digest 오염 | reserved 864 → refresh 0.176 s → sha256 2.547 s 불일치 → abort 게시 | abort 드레인(nudge) → B idle → A `cxl_freed` 2,264,924,160 B, leases 0/0, **gate ok**, hook 5.7 s |
+
+**사고 1건(원인 확정·수정)**: 첫 `fail_wrongkey`에서 A cleanup이 다른 RPC 스레드에서 실행되어 provider `my_id`(TLS)가 -1 → lock timeout 480 s → **EngineCore abort**. 격리 재현 후 agent의 모든 provider 호출을 전용 스레드 1개로 직렬화(`bf589151e`, `provider-api-findings` §4). 첫 `fail_checksum`은 hook이 상태 한 번에 reserved→failed 진행을 try 밖에서 관측해 정리 없이 종료 → 수정(`dd347096f`) 후 재실행. 이슈·질문 정리 = `review-request-2026-09-06-cleanup-gate.md`.
+
 ## 다른 gate
 
 | Gate | 상태 | 비고 |
 | --- | --- | --- |
+| 실패 주입·정리 | **PASS** | wrong_key / checksum 둘 다 `CLEANUP_GATE ok`, 실패 전파 확인. 위 참조 |
 | G-B | **headroom 계측 진단 완료 / 고정 배치 미검증** | 통과 조건(카운터 해석·무오류) 충족, "worker당 4 고정" 전제 미충족. 1차 INVALID(cache 오염) → 2차 유효 |
 | G-C | **PASS** | 고정 endpoint(네임스페이스 분리)로 목적지 보장. 위 참조 |
 | G-D | **PASS** | in-engine agent + 제어 채널 + nudge로 export→TCP→import→restore end-to-end. 위 참조 |

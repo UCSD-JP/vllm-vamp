@@ -132,3 +132,10 @@ raw 결과: jpserver `asplos_paper/solab_testbed/results/ga_2026-09-05/` (17 fil
 | target header/receipt로 worker 선택이 보장되지 않음 | 동의 | **네임스페이스 분리 고정 endpoint**(frontend `--namespace`, worker `DYN_NAMESPACE`)로 목적지를 토폴로지로 고정 — G-C PASS | gate-results §G-C |
 
 Codex 리뷰 문서(`full-review-42731a5.md`, `demo-feasibility-plan-2026-09-05.md`)와 bundle은 jp 로컬에만 있어 이 세션에서 읽지 못했다. 원격 push 또는 jpserver 전송 후 대조 필요.
+
+## 8. G-C / G-D 이후 상태 (2026-09-06)
+
+- **export→import→실제 추론 경로 연결됨**(2차 리뷰 "실제 연결부 미완성" 해소): `solab/vamp_agent.py`(EngineCore 내 agent: READY 콜백 동기 pin, 제어 채널, PayloadReceiver, mailbox reserve/commit) + `solab/gd_hook.py`(gap 중 orchestration, nudge). 실제 2.1 GB KV bytes가 A→B로 이동하고 B가 restore로 정답을 냈다(gate-results §G-D).
+- cross-host BlockHash 일치: `PYTHONHASHSEED=0`로 충분함을 실측(B commit 시 READY hash head = A와 동일, B lookup이 A 키로 hit).
+- 남은 것: G-E/F(CXL, provider 확인 BLOCKED), G-G의 CXL 변형, G-H calibration, 정책 비교. idle 엔진의 mailbox drain을 위한 nudge는 임시 수단 — vLLM 측 idle tick이 없어 현재 스택에선 대안이 없음(문서화).
+- 리뷰 시 볼 것: agent가 worker-side tensor에 쓰는 시점(`import_written`)이 scheduler-side commit(`import_committed`) 이전이며 그 사이 해당 슬롯은 RESERVED(READY 아님) — `reserve_import`가 prepare_store로 슬롯을 잡아두므로 다른 store가 덮어쓰지 않음. 테스트 `test_solab_agent_pins_first_large_ready_run_only`(실제 manager, s1 8/8).

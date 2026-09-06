@@ -196,14 +196,54 @@ etcd `instances/vampA/backend/generate`=1, `instances/vampB/...`=1 검증. 양 w
 **판정: PASS** — 목적지 local-cold(B connector 0 hit), 실제 다른 worker 실행(네임스페이스 인스턴스 1 + s2 sidecar가 2요청분), recompute 확인(4.175 s ≈ A의 cold 4.189 s). 5/5 marker 일치.
 concurrency 1이므로 4.18 s는 12.8K tok cold prefill의 **큐 대기 없는 응답 지연**이다(service time 근사치로 참고 가능; 여전히 응답 지연).
 
+## G-D: B1 한 세션 실제 KV network migration (2026-09-06)
+
+토폴로지는 G-C와 동일(vampA=s1:8080, vampB=s2:8081). 양 worker를 **in-engine agent**(`solab/vamp_agent.py`, `spec_module_path`)로 재기동:
+A는 첫 ≥64-block READY run을 **scheduler thread에서 동기 pin**(export candidate), 제어 채널(7001/7002)과 `PayloadReceiver`(7101/7102)를 EngineCore 안에서 서비스.
+`--salt gd`, tier 초기화. 1 세션 turn 0–2 → A, **gap 중 hook**(`solab/gd_hook.py`) → turn 3–4 → B. 순차.
+
+hook 순서: A status(candidate 801 blocks) → A `hashes` → B `import_prepare`(reserve 포스트) → **B nudge #1**(idle 엔진 step 유발 → mailbox drain) → B reserved(801, evicted 0)
+→ A `export`(bridge.gather → TCP → B receiver) → B payload 수신·검증 → `bridge.import_payload` → commit 포스트 → **B nudge #2** → committed. 총 26.8 s.
+
+| 단계 (agent 로그) | 값 |
+| --- | --- |
+| A `candidate_pinned` | 801 blocks, lease 1, hashes head `20e88d2f…, a770f5f8…, aab8398f…` |
+| A `export_done` | nbytes **2,099,773,440** (= 801 × 2,621,440), gather 1.271 s, TCP send **21.66 s** (~97 MB/s), sha256 `8a9722…`, DONE |
+| B `import_reserved` | 801 to_store, 0 evicted |
+| B `import_payload_received` | 2,099,773,440 B, **complete=true** (receiver가 chunk별 sha256[:16] + 전체 sha256 검증), error null |
+| B `import_written` | 0.413 s (CPU tensor에 zero-copy 대상 슬롯 기록) |
+| B `import_committed` | 801 blocks; 이때 발생한 READY 이벤트의 hashes head가 **A와 동일** → A의 BlockHash가 B의 키로 그대로 유효 (`PYTHONHASHSEED=0`) |
+
+| turn | endpoint | latency | 해석 |
+| --- | --- | --- | --- |
+| 0 | A | 4.174 s | cold |
+| 1–2 | A | 0.537 / 0.540 s | GPU hit |
+| **3** | **B** | **0.641 s** | **GPU miss → connector lookup → 가져온 CPU tier hit → restore** |
+| 4 | B | 0.533 s | GPU hit |
+
+| worker | GPU prefix hit | connector | 비고 |
+| --- | --- | --- | --- |
+| s1 (A) | 25,600 / 38,457 | 0 / 12,857 | G-C와 동일 |
+| s2 (B) | 12,800 / 25,669 | **12,800 / 12,869 (99.5%)** | turn 3에서 800 blocks × 16 tok 복원; 801번째 block은 A turn-0 고유 suffix라 미사용(정합) |
+
+**판정: PASS** — source/destination checksum 일치(receiver 검증), prefix/layout 일치(801 × block_bytes 정확, to_store 801), import+restore 완료 후 B가 정답 marker 출력(2/2).
+G-C 대비 B 첫 턴 4.175 s → 0.641 s는 **같은 조건(순차, 12,819 tok)에서의 관측 지연 차이**이며, 전송 자체(21.7 s)는 gap 중에 일어났다.
+
+관측 주의:
+- TCP 전송 21.7 s(~97 MB/s)는 **B1 correctness prototype**의 값이며 성능 baseline이 아니다(spec §4). 이 값으로는 gap 없는 즉시 이동(MOVE_IMMEDIATE)에서 재계산(4.2 s)보다 느리다 — 이동이 이득이 되려면 요청 없는 gap에 전송이 끝나야 한다는 점을 실측이 그대로 보여준다.
+- nudge 요청 2건(각 2 tokens)이 B에 추가로 들어갔다(cell 밖으로 기록; B READY 1-block 이벤트 2개). idle EngineCore는 step을 돌리지 않으므로 mailbox 명령(reserve/commit)을 drain하려면 현재로선 필요하다.
+- B agent가 import된 run을 자기 candidate로 pin했다(lease 2) — "첫 큰 READY run pin" 규칙의 부작용, 무해하나 기록.
+- Dynamo patch 미적용, vLLM 소스 무수정 유지.
+
 ## 다른 gate
 
 | Gate | 상태 | 비고 |
 | --- | --- | --- |
 | G-B | **headroom 계측 진단 완료 / 고정 배치 미검증** | 통과 조건(카운터 해석·무오류) 충족, "worker당 4 고정" 전제 미충족. 1차 INVALID(cache 오염) → 2차 유효 |
 | G-C | **PASS** | 고정 endpoint(네임스페이스 분리)로 목적지 보장. 위 참조 |
-| G-D | NOT_RUN | scheduler↔worker RPC 미구현(in-process mailbox까지) |
-| G-E~G-G | NOT_RUN | 실제 CXL 접근 — **별도 안전 승인 전 실행 금지**(manager protocol/offset origin 미확인) |
+| G-D | **PASS** | in-engine agent + 제어 채널 + nudge로 export→TCP→import→restore end-to-end. 위 참조 |
+| G-E~G-F | NOT_RUN / **BLOCKED** | 실제 CXL 접근 — provider 확인(manager startup/clear protocol, offset origin, fence/refresh primitive, lock ABI) 전 실행 금지 |
+| G-G | **PARTIAL** | 요청 없는 gap 중 publication은 **network 목적지로 실증**(G-D hook이 양 엔진 idle 상태에서 수행); DRAM→CXL 변형은 G-E/F 승인 후 |
 | G-H | NOT_RUN | |
 
 ## 부수 확인

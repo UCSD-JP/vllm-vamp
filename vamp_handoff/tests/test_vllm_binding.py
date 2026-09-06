@@ -175,6 +175,53 @@ class SchedulerSideBinding(unittest.TestCase):
         self.assertEqual(len(grabbed), 1)
         self.assertEqual(m.active_leases(), 0)
 
+    def test_solab_agent_pins_first_large_ready_run_only(self):
+        # solab/vamp_agent.py: the in-engine agent pins the first READY run of
+        # at least VAMP_PIN_MIN_BLOCKS blocks (the session prefix) and ignores
+        # small runs (warm-up, per-turn suffix). No sockets: ports unset.
+        import importlib
+        import os
+        import sys
+
+        solab = str(HANDOFF / "solab")
+        if solab not in sys.path:
+            sys.path.insert(0, solab)
+        os.environ.pop("VAMP_PROBE_FILE", None)
+        os.environ["VAMP_PIN_MIN_BLOCKS"] = "3"
+        os.environ.pop("VAMP_AGENT_PORT", None)
+        os.environ.pop("VAMP_PAYLOAD_PORT", None)
+        import vamp_agent
+
+        vamp_agent = importlib.reload(vamp_agent)
+        from vamp_cxl import vllm_binding as vb
+
+        m = VampCPUOffloadingManager(block_size=32, num_blocks=8)
+        m.bind_owner_thread()
+        vb._REGISTRY["manager"] = m
+        try:
+            listener = vamp_agent.AgentListener()
+            m.listener = listener
+            self._store(m, ["w"])  # warm-up sized run: below the threshold
+            self.assertIsNone(vamp_agent.STATE.candidate)
+            a, b, c = self._store(m, ["a", "b", "c"])  # prefix run: pinned
+            self.assertIsNotNone(vamp_agent.STATE.candidate)
+            self.assertEqual(vamp_agent.STATE.candidate.block_hashes, (a, b, c))
+            self.assertEqual(m.active_leases(), 1)
+            self._store(m, ["d", "e", "f"])  # later large run: only one candidate
+            self.assertEqual(vamp_agent.STATE.candidate.block_hashes, (a, b, c))
+            self.assertEqual(m.active_leases(), 1)
+            # pinned prefix survives pressure: new stores evict others first
+            out = m.prepare_store([bh("g"), bh("h")])
+            self.assertIsNotNone(out)
+            self.assertFalse(set(out.block_hashes_evicted) & {a, b, c})
+            # hashes command payload round-trips as hex
+            hexes = [h.hex() for h in vamp_agent.STATE.candidate_hashes]
+            self.assertEqual([bytes.fromhex(x) for x in hexes], [bytes(a), bytes(b), bytes(c)])
+        finally:
+            vb._REGISTRY.pop("manager", None)
+            vamp_agent.STATE.candidate = None
+            vamp_agent.STATE.candidate_hashes = None
+
     def test_import_reservation_and_commit(self):
         m, listener = self._manager()
         res = m.reserve_import([bh("x"), bh("y")])

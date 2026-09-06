@@ -68,8 +68,16 @@ def main():
     parser.add_argument("--words", type=int, default=1000)
     parser.add_argument("--salt", required=True)
     parser.add_argument("--inject", choices=["checksum"])
+    parser.add_argument(
+        "--verify",
+        choices=["sha256", "gpu64", "none"],
+        default="sha256",
+        help="sha256 = host readback baseline; gpu64 = per-block GPU sums (non-cryptographic); none = skipped",
+    )
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
+    if args.inject and args.verify == "none":
+        parser.error("checksum injection needs a verification mode")
     a = ("192.168.5.61", 7001, "http://localhost:8080/v1/chat/completions")
     b = ("localhost", 7002, "http://localhost:8081/v1/chat/completions")
     rows = []
@@ -113,11 +121,15 @@ def main():
         assert pre["candidate_blocks"] > 0, pre
         if args.arm == "D3":
             key = "D3_" + args.salt
-            ex = job(*a, dict(cmd="export", key=key))
+            ex = job(*a, dict(cmd="export", key=key, verify=args.verify))
             emit("export", **ex)
             assert ex["ok"], ex
             im = job(*b, dict(cmd="import", key=key, inject=args.inject))
             emit("import", **im)
+            if im.get("ok"):
+                assert im.get("verify") == args.verify, im
+                # a skipped verification must never be reported as verified
+                assert im.get("verified") == (args.verify != "none"), im
             if args.inject:
                 assert not im["ok"], im
                 status = rpc(*b[:2], dict(cmd="status"))

@@ -76,7 +76,25 @@ class GpuBridge:
             pos += count
         torch.cuda.synchronize()
 
-    def transfer(self, block_ids, ptr, to_cxl, api, verify=True):
+    VERIFY_MODES = ("sha256", "gpu64", "none")
+
+    def gpu_block_sums(self, nblocks, nbytes):
+        """Per-block 64-bit wraparound sums computed on the GPU over the staging
+        chunk. Non-cryptographic: detects block misplacement/order errors and
+        gross corruption without reading 2 GiB back to the host."""
+        x = self.stage[:nbytes].view(torch.int64).view(nblocks, -1)
+        return x.sum(dim=1).cpu().numpy().tobytes()
+
+    def transfer(self, block_ids, ptr, to_cxl, api, verify="sha256"):
+        """verify: 'sha256' = read every chunk back to the host and SHA-256 it
+        (correctness baseline); 'gpu64' = per-block GPU sums hashed (no readback);
+        'none' = verification skipped (recorded as skipped, never as verified)."""
+        if verify is True:
+            verify = "sha256"
+        if verify is False or verify is None:
+            verify = "none"
+        if verify not in self.VERIFY_MODES:
+            raise ValueError(f"unknown verify mode {verify}")
         size = len(block_ids) * self.block_bytes
         timings = dict(
             register_s=0.0,
@@ -117,12 +135,15 @@ class GpuBridge:
                     start = time.monotonic()
                     self.scatter(ids)
                     timings["scatter_s"] += time.monotonic() - start
-                if verify:
+                if verify != "none":
                     start = time.monotonic()
-                    # Read back scattered destination KV, not only staging.
+                    # Verify the scattered destination KV, not only staging.
                     if not to_cxl:
                         self.gather(ids)
-                    sha.update(self.stage[:nbytes].cpu().numpy().tobytes())
+                    if verify == "sha256":
+                        sha.update(self.stage[:nbytes].cpu().numpy().tobytes())
+                    else:
+                        sha.update(self.gpu_block_sums(len(ids), nbytes))
                     timings["verify_s"] += time.monotonic() - start
             if to_cxl:
                 start = time.monotonic()
@@ -132,9 +153,12 @@ class GpuBridge:
             start = time.monotonic()
             self.check(self.cuda.cudaHostUnregister(ptr))
             timings["unregister_s"] = time.monotonic() - start
+        digest = sha.hexdigest() if verify != "none" else None
         return dict(
             timings,
-            sha256=sha.hexdigest() if verify else None,
+            verify=verify,
+            digest=digest,
+            sha256=digest if verify == "sha256" else None,
             nbytes=size,
             staging_bytes=self.capacity,
             chunks=len(

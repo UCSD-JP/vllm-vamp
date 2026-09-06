@@ -15,6 +15,7 @@ set -u -o pipefail
 SALT="${1:?salt}"; shift
 ARMS=("$@"); [ ${#ARMS[@]} -gt 0 ] || ARMS=(B0 B1 B2)
 RUN="${RUN:-cmp_${SALT}}"; GAPS="${GAPS:-0}"
+VERIFY="${VERIFY:-sha256}"   # staged CXL arm verification: sha256 (baseline) or none (ablation, reported as skipped)
 TA=${TURNS_A:-3}; TB=${TURNS_B:-2}; PW=${PREFIX_WORDS:-1000}
 export WARMUP_URLS="http://localhost:8080/v1/chat/completions,http://localhost:8081/v1/chat/completions"
 for gap in $GAPS; do
@@ -22,7 +23,7 @@ for arm in "${ARMS[@]}"; do
   case "$arm" in
     B0) HOOK=""; POST="python ~/vamp/gf_hook.py --cleanup-only";;
     B1) HOOK="python ~/vamp/gd_hook.py"; POST="";;
-    B2) HOOK="python ~/vamp/gf_hook.py --key VAMP_KV_${RUN}_${arm}_g${gap}"; POST="";;
+    B2) HOOK="python ~/vamp/gf_hook.py --key VAMP_KV_${RUN}_${arm}_g${gap} --verify ${VERIFY}"; POST="";;
     *) echo "unknown arm $arm"; exit 2;;
   esac
   CELL="${RUN}_${arm}_g${gap}"

@@ -142,10 +142,11 @@ class State:
         self.exported = dict(
             key=key, ptr=p, size=size, lock=lock, record=None, published=False
         )
+        verify = cmd.get("verify", "sha256")
         api.lock_acquire(lock)
         try:
             result = self.bridge.transfer(
-                [b.block_id for b in self.candidate], p, True, api
+                [b.block_id for b in self.candidate], p, True, api, verify=verify
             )
             rec = dict(
                 magic="VAMP_D3_1",
@@ -158,6 +159,8 @@ class State:
                 block_tokens=self.block_tokens,
                 chunk_bytes=self.bridge.capacity,
                 hashes=[h.hex() for h in self.hashes],
+                verify=verify,
+                digest=result["digest"],
                 sha256=result["sha256"],
             )
             body = json.dumps(rec).encode()
@@ -205,17 +208,25 @@ class State:
                 raise ValueError("D3 payload bounds/size mismatch")
             res = GpuReservation(self.pool, hashes, make_block_hash_with_group_id)
             self.imported = res
+            # the verification mode is fixed by the publisher; the importer uses the same
+            verify = rec.get("verify", "sha256")
             try:
                 result = self.bridge.transfer(
                     [b.block_id for b in res.blocks],
                     api.get_ptr(rec["payload_off"]),
                     False,
                     api,
+                    verify=verify,
                 )
-                expected = (
-                    "0" * 64 if cmd.get("inject") == "checksum" else rec["sha256"]
-                )
-                match = result["sha256"] == expected
+                if verify == "none":
+                    # verification skipped: publish on copy completion only (recorded as such)
+                    match, verified = True, False
+                else:
+                    expected = (
+                        "0" * 64 if cmd.get("inject") == "checksum" else rec["digest"]
+                    )
+                    match = result["digest"] == expected
+                    verified = match
                 res.commit(copy_complete=True, digest_match=match)
             except Exception:
                 res.abort()
@@ -237,9 +248,12 @@ class State:
             gpu_cached_after=sum(
                 bool(self.pool.get_cached_block(h, [0])) for h in hashes
             ),
+            verified=verified,
             **result,
         )
-        return dict(ok=True, n_blocks=len(hashes), digest_match=match, **result)
+        return dict(
+            ok=True, n_blocks=len(hashes), digest_match=match, verified=verified, **result
+        )
 
     def cleanup(self, cmd):
         if self.imported is not None:

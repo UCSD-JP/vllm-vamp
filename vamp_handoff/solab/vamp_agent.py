@@ -265,12 +265,13 @@ class CxlImportState:
         self.stage = "idle"
         self.error = None
         self.timings = {}
+        self.verify = "sha256"
 
 
 CXL_IMPORT = CxlImportState()
 
 
-def _cxl_export(key):
+def _cxl_export(key, verify="sha256"):
     """A side: copy the pinned prefix run into the CXL payload arena and publish it."""
     import cxl_kv_record as R
     br = _b.current_bridge(); lease = STATE.candidate
@@ -290,7 +291,13 @@ def _cxl_export(key):
     ctypes.memmove(pptr, src, n)
     t["cxl_write_s"] = round(time.time() - t0, 3)
     t0 = time.time(); api.fence(pptr, n); t["fence_s"] = round(time.time() - t0, 3)
-    t0 = time.time(); digest = hashlib.sha256(payload).digest(); t["sha256_s"] = round(time.time() - t0, 3)
+    if verify == "none":
+        # verification skipped (ablation): the record carries a zero digest and the
+        # importer must have been told the same mode; reported as skipped, not verified
+        digest = bytes(32); t["sha256_s"] = 0.0
+    else:
+        t0 = time.time(); digest = hashlib.sha256(payload).digest(); t["sha256_s"] = round(time.time() - t0, 3)
+    t["verify"] = verify
     blob = R.pack_hashes(STATE.candidate_hashes)
     hptr = api.shmalloc(len(blob)); api.write(hptr, blob); api.fence(hptr, len(blob))
     rptr = api.shmalloc(R.SIZE); lock = api.lock_alloc()
@@ -375,7 +382,7 @@ def _cleanup(scope, confirmed):
     return {"ok": True, **done}
 
 
-def _cxl_import_prepare(key, inject=None):
+def _cxl_import_prepare(key, inject=None, verify="sha256"):
     """B side: read the record + hashes under the entry lock, post the reservation.
     inject="checksum" corrupts the expected digest so the post-reservation verify fails
     (exercises the abort/cleanup path without touching the shared data)."""
@@ -403,7 +410,10 @@ def _cxl_import_prepare(key, inject=None):
     from vllm.v1.core.kv_cache_utils import BlockHash
     CXL_IMPORT.__init__()
     CXL_IMPORT.key, CXL_IMPORT.rec = key, rec
+    CXL_IMPORT.verify = verify
     if inject == "checksum":
+        if verify == "none":
+            return {"ok": False, "error": "checksum injection needs a verification mode"}
         rec = R.KvRecord(rec.generation, rec.nbytes, rec.n_blocks, rec.block_bytes, rec.lockptr,
                          rec.payload_off, rec.hashes_off, rec.hashes_len, rec.state, bytes(32))
         CXL_IMPORT.rec = rec
@@ -435,10 +445,14 @@ def _cxl_import_advance():
         pptr = api.get_ptr(rec.payload_off)
         t0 = time.time(); api.refresh(pptr, rec.nbytes); S.timings["refresh_s"] = round(time.time() - t0, 3)
         view = memoryview((ctypes.c_char * rec.nbytes).from_address(pptr)).cast("B")  # view of the CXL mapping; import_payload copies it into the CPU tier
-        t0 = time.time(); digest = hashlib.sha256(view).digest(); S.timings["sha256_s"] = round(time.time() - t0, 3)
-        if digest != rec.sha256:
-            S.stage, S.error = "failed", f"checksum mismatch after refresh: {digest.hex()} != {rec.sha256.hex()}"
-            S.commit_future = mgr.commit_import_async(res, False); _log("cxl_import_failed", error=S.error); return
+        if getattr(S, "verify", "sha256") == "none":
+            S.timings["sha256_s"] = 0.0; S.timings["verify"] = "skipped"
+        else:
+            t0 = time.time(); digest = hashlib.sha256(view).digest(); S.timings["sha256_s"] = round(time.time() - t0, 3)
+            S.timings["verify"] = "sha256"
+            if digest != rec.sha256:
+                S.stage, S.error = "failed", f"checksum mismatch after refresh: {digest.hex()} != {rec.sha256.hex()}"
+                S.commit_future = mgr.commit_import_async(res, False); _log("cxl_import_failed", error=S.error); return
         t0 = time.time(); br.import_payload(res.block_ids, view); S.timings["cxl_to_cpu_s"] = round(time.time() - t0, 3)
         S.commit_future = mgr.commit_import_async(res, True); S.stage = "commit_posted"
         _log("cxl_import_written", nbytes=rec.nbytes, **S.timings)
@@ -497,9 +511,9 @@ def _handle(conn):
                 _advance_import(); out = {"ok": True, "stage": STATE.import_stage, "error": STATE.import_error,
                                            "reservation_blocks": None if STATE.import_reservation is None else len(STATE.import_reservation.block_ids)}
             elif cmd == "cxl_export":
-                out = _cxl_run(_cxl_export, req["key"])
+                out = _cxl_run(_cxl_export, req["key"], req.get("verify", "sha256"))
             elif cmd == "cxl_import_prepare":
-                out = _cxl_run(_cxl_import_prepare, req["key"], req.get("inject"))
+                out = _cxl_run(_cxl_import_prepare, req["key"], req.get("inject"), req.get("verify", "sha256"))
             elif cmd == "cleanup":
                 out = _cxl_run(_cleanup, req.get("scope", "all"), bool(req.get("confirmed", False)))
             elif cmd == "cxl_import_status":

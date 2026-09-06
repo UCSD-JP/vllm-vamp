@@ -21,7 +21,11 @@ P.add_argument("--model", default="Qwen/Qwen3-14B")
 P.add_argument("--key", default="VAMP_KV_gf")
 P.add_argument("--inject", default=None, choices=[None, "wrong_key", "checksum"], help="failure injection for the cleanup gate")
 P.add_argument("--cleanup-only", action="store_true", help="skip export/import; only drain B's pending abort and run the serial release + gate")
+P.add_argument("--verify", choices=["sha256", "none"], default="sha256",
+               help="sha256 = correctness baseline; none = verification skipped (ablation; reported as skipped, never verified)")
 args = P.parse_args()
+if args.inject == "checksum" and args.verify == "none":
+    P.error("checksum injection needs --verify sha256")
 
 STAGES = ["idle", "reserve_posted", "reserved", "commit_posted", "committed"]
 def wait(target, budget):
@@ -36,12 +40,13 @@ a = rpc(args.a_agent, {"cmd": "status"})
 step("A_status", candidate_blocks=a.get("candidate_blocks"), leases=a.get("active_leases"))
 if not a.get("candidate_blocks"):
     step("abort", reason="A has no pinned candidate"); sys.exit(2)
-exp = rpc(args.a_agent, {"cmd": "cxl_export", "key": args.key})
+exp = rpc(args.a_agent, {"cmd": "cxl_export", "key": args.key, "verify": args.verify})
 step("A_cxl_export", **exp)
 if not exp.get("ok"):
     ok, cs = cleanup_and_verify(args); finish("failed", ok, cs, reason="export failed"); sys.exit(3)
 key_for_b = args.key + "_MISSING" if args.inject == "wrong_key" else args.key
-prep = rpc(args.b_agent, {"cmd": "cxl_import_prepare", "key": key_for_b, "inject": args.inject if args.inject == "checksum" else None})
+prep = rpc(args.b_agent, {"cmd": "cxl_import_prepare", "key": key_for_b, "verify": args.verify,
+                          "inject": args.inject if args.inject == "checksum" else None})
 step("B_cxl_import_prepare", **prep)
 if not prep.get("ok"):
     # wrong key: nothing was reserved at B; A still holds everything -> release it
@@ -65,5 +70,5 @@ except HookFailure as e:
     sys.exit(e.code)
 transfer_s = round(time.time() - T0, 3)
 ok, cs = cleanup_and_verify(args)
-finish("ok", ok, cs, transfer_s, key=args.key)
+finish("ok", ok, cs, transfer_s, key=args.key, verify=args.verify if args.verify != "none" else "skipped")
 sys.exit(0 if ok else 6)

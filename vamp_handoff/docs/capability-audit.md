@@ -83,3 +83,10 @@
 | foreign READY entry 읽기 | 미해결 → **해소 경로 확정** | 레코드에 lockptr(8 B) 저장 → 타 노드가 `cxl_lock_t` 재구성. `_lookup` 채택 시 lock=None 대신 레코드 lockptr 사용(구현 예정) |
 | manager startup/clear | 미확인 → **CONFIRMED** | node0·rank0 init이 메타 138 MB zero + 10 GiB 0xAA; 재기동 금지 규칙; `cxl_clear_ucsd`=[64 GiB,128 GiB) |
 | crash recovery | BLOCKED 유지 | 데모 범위: 실패 시 clear + cold restart |
+
+## 2026-09-06 (후속) 실장비 확정
+
+- lock handle ABI: **ctypes로 실증** — `cxl_shm_allocate_lock(uint64*)`, `lock_acquire/release(uint64 값)`; s1이 s2가 만든 lock을 lockptr로 재구성해 acquire 성공.
+- cross_host_visibility_primitive: **실증** — `clwb_region_with_barrier`(fence) / `clflush_region_with_mfence`(refresh); refresh 생략 시 부분 stale 혼합 checksum 관측(negative test).
+- foreign READY entry 읽기: **구현·에뮬 테스트 완료**(레코드 lockptr), 실장비 store 레벨 검증은 G-F에서.
+- 남은 BLOCKED: crash recovery(dead writer slot) — 데모 범위 밖(clear + cold restart).

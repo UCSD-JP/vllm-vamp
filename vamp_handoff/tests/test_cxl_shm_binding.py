@@ -109,7 +109,7 @@ class EmulatedStore(unittest.TestCase):
         self.assertTrue(store.commit_ready(res, good).accepted)
         self.assertEqual(store.state_of(p)[0], CxlState.READY)
         rec = EntryRecord.unpack(
-            api.read(api.get(store._key(p)), 8 + 4 + 4 + 8 * 5 + 64 * 3 + 32)
+            api.read(api.get(store._key(p)), 8 + 4 + 4 + 8 * 5 + 64 * 3 + 32 + 8)  # + lockptr
         )
         self.assertEqual(rec.state, EntryState.READY)
         self.assertEqual(rec.checksum, chk)
@@ -394,6 +394,33 @@ class EmulatedStore(unittest.TestCase):
         )
         self.assertEqual(store._occupied + other._occupied, 2 * BLK)
 
+    def test_foreign_ready_entry_is_readable_via_record_lockptr(self):
+        # Single-manager mode: the manager (w0) reserves/writes/commits; a
+        # read-only instance on another host (w1) finds the entry, rebuilds the
+        # entry lock from the record's lockptr and takes a reader lease.
+        store, api = make_store()
+        p = prefix(salt="shared")
+        res = store.reserve(p, 4096, "w0").reservation
+        store.mark_writing(res)
+        data = bytes(os.urandom(4096))
+        api.write(store.payload_ptr(res), data)
+        import hashlib
+
+        from vamp_cxl.cxl_shm_binding import CompletionProof
+
+        digest = hashlib.sha256(data).hexdigest()
+        proof = CompletionProof(
+            "j", store.allocator_id, res.generation, res.reservation_id, digest, 4096
+        )
+        self.assertTrue(store.commit_ready(res, proof).accepted)
+        other, _ = make_store(api=api, writer="w1")
+        self.assertTrue(other.read_only)
+        grant = other.acquire_ready(p, "readerB")
+        self.assertNotIsInstance(grant, Miss, grant)
+        self.assertEqual(grant.checksum, digest)
+        self.assertEqual(api.read(api.get_ptr(grant.payload_ref.relative_offset), 4096), data)
+        other.release(grant.lease_id)
+
 
 class CtypesBindingRefusesUnconfirmed(unittest.TestCase):
     def test_no_library_offline(self):
@@ -422,7 +449,7 @@ class CtypesBindingRefusesUnconfirmed(unittest.TestCase):
             CtypesProviderApi(
                 AbiConfirmation({}, library_sha256="00" * 32), library_path=libc
             )
-        self.assertEqual(len(PROPOSED_SIGNATURES), 10)
+        self.assertEqual(len(PROPOSED_SIGNATURES), 19)
         self.assertEqual(sig.digest(), sig.digest())
         time.sleep(0)
 

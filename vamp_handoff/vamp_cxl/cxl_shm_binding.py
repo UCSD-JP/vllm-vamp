@@ -112,6 +112,20 @@ class ProviderApi(ABC):
     @abstractmethod
     def write(self, ptr: int, data: bytes | memoryview) -> None: ...
 
+    # -- optional surface with safe defaults -----------------------------------
+    def payload_alloc(self, nbytes: int) -> int:
+        """Large payload region (provider `shm_payload_alloc`); falls back to shmalloc."""
+        return self.shmalloc(nbytes)
+
+    def payload_free(self, ptr: int, nbytes: int) -> None:
+        self.shfree(ptr)
+
+    def fence(self, ptr: int, nbytes: int) -> None:
+        """Write-back written lines before publishing (no-op where coherent)."""
+
+    def refresh(self, ptr: int, nbytes: int) -> None:
+        """Invalidate possibly stale local lines before reading (no-op where coherent)."""
+
 
 class EmulatedProviderApi(ProviderApi):
     """In-process emulation for tests. Pointer = base + offset so that a
@@ -239,6 +253,24 @@ PROPOSED_SIGNATURES: dict[str, CSignature] = {
     "cxl_shm_destroy": CSignature("cxl_shm_destroy", "int", ("char*",)),
     "cxl_shm_get_offset": CSignature("cxl_shm_get_offset", "uint64", ("void*",)),
     "cxl_shm_get_ptr": CSignature("cxl_shm_get_ptr", "void*", ("uint64",)),
+    # confirmed 2026-09-06 from api.h/cacheline.h + nm -D + solab/cxl_ping.c:
+    # cxl_lock_t is `struct { volatile shm_ptr_t lockptr; }` (8 bytes) passed by
+    # value, i.e. one uint64 register; allocate_lock takes a pointer to it.
+    "shm_payload_alloc": CSignature("shm_payload_alloc", "void*", ("size_t",)),
+    "shm_payload_free": CSignature("shm_payload_free", "void", ("void*", "size_t")),
+    "cxl_shm_allocate_lock": CSignature("cxl_shm_allocate_lock", "int", ("uint64*",)),
+    "cxl_shm_free_lock": CSignature("cxl_shm_free_lock", "void", ("uint64",)),
+    "cxl_shm_lock_acquire": CSignature("cxl_shm_lock_acquire", "int", ("uint64",)),
+    "cxl_shm_lock_release": CSignature("cxl_shm_lock_release", "void", ("uint64",)),
+    "clwb_region_with_barrier": CSignature(
+        "clwb_region_with_barrier", "void", ("void*", "size_t")
+    ),
+    "clflush_region_with_mfence": CSignature(
+        "clflush_region_with_mfence", "void", ("void*", "size_t")
+    ),
+    "clflush_region_with_sfence": CSignature(
+        "clflush_region_with_sfence", "void", ("void*", "size_t")
+    ),
 }
 
 _CTYPES = {
@@ -249,6 +281,7 @@ _CTYPES = {
     "char*": ctypes.c_char_p,
     "size_t": ctypes.c_size_t,
     "uint64": ctypes.c_uint64,
+    "uint64*": ctypes.POINTER(ctypes.c_uint64),
 }
 
 
@@ -336,17 +369,38 @@ class CtypesProviderApi(ProviderApi):
         if self._fn("cxl_shm_destroy")(key.encode()) != 0:
             raise RuntimeError(f"cxl_shm_destroy({key}) failed")
 
-    def lock_alloc(self) -> Any:
-        raise AbiNotConfirmed("lock handle ABI not confirmed")
+    # lock handle = the 8-byte lockptr value (cxl_lock_t by value); it is an
+    # offset, so a reader on another host can rebuild it from our record.
+    def lock_alloc(self) -> int:
+        handle = ctypes.c_uint64(0)
+        if self._fn("cxl_shm_allocate_lock")(ctypes.byref(handle)) != 0:
+            raise RuntimeError("cxl_shm_allocate_lock failed")
+        return int(handle.value)
 
-    def lock_free(self, handle: Any) -> None:
-        raise AbiNotConfirmed("lock handle ABI not confirmed")
+    def lock_free(self, handle: int) -> None:
+        self._fn("cxl_shm_free_lock")(ctypes.c_uint64(handle))
 
-    def lock_acquire(self, handle: Any) -> None:
-        raise AbiNotConfirmed("lock handle ABI not confirmed")
+    def lock_acquire(self, handle: int) -> None:
+        if self._fn("cxl_shm_lock_acquire")(ctypes.c_uint64(handle)) != 0:
+            raise RuntimeError(f"cxl_shm_lock_acquire({handle}) failed")
 
-    def lock_release(self, handle: Any) -> None:
-        raise AbiNotConfirmed("lock handle ABI not confirmed")
+    def lock_release(self, handle: int) -> None:
+        self._fn("cxl_shm_lock_release")(ctypes.c_uint64(handle))
+
+    def payload_alloc(self, nbytes: int) -> int:
+        ptr = self._fn("shm_payload_alloc")(nbytes)
+        if not ptr:
+            raise MemoryError("shm_payload_alloc returned NULL")
+        return int(ptr)
+
+    def payload_free(self, ptr: int, nbytes: int) -> None:
+        self._fn("shm_payload_free")(ctypes.c_void_p(ptr), nbytes)
+
+    def fence(self, ptr: int, nbytes: int) -> None:
+        self._fn("clwb_region_with_barrier")(ctypes.c_void_p(ptr), nbytes)
+
+    def refresh(self, ptr: int, nbytes: int) -> None:
+        self._fn("clflush_region_with_mfence")(ctypes.c_void_p(ptr), nbytes)
 
     def get_offset(self, ptr: int) -> int:
         return int(self._fn("cxl_shm_get_offset")(ctypes.c_void_p(ptr)))
@@ -368,8 +422,9 @@ class CtypesProviderApi(ProviderApi):
 
 MAGIC = b"VAMPKV01"
 # magic, version, state, generation, payload_offset, payload_len, rounded_len,
-# reader_count, checksum, model digest, prefix digest, writer id
-_ENTRY = struct.Struct("!8sIIQQQQQ64s64s64s32s")
+# reader_count, checksum, model digest, prefix digest, writer id,
+# lockptr (provider lock handle value; lets another host rebuild the entry lock)
+_ENTRY = struct.Struct("!8sIIQQQQQ64s64s64s32sQ")
 # magic, next_generation, entries, allocator_id, owner writer_id (single manager)
 _DIR = struct.Struct("!8sQQ32s32s")
 
@@ -398,6 +453,7 @@ class EntryRecord:
     model_digest: str
     prefix_digest: str
     writer_id: str
+    lockptr: int = 0
 
     def pack(self) -> bytes:
         return _ENTRY.pack(
@@ -413,13 +469,13 @@ class EntryRecord:
             self.model_digest.encode()[:64],
             self.prefix_digest.encode()[:64],
             self.writer_id.encode()[:32],
+            int(self.lockptr),
         )
 
     @classmethod
     def unpack(cls, raw: bytes) -> EntryRecord:
-        magic, version, state, gen, poff, plen, rlen, readers, chk, mdl, pfx, wid = (
-            _ENTRY.unpack(raw)
-        )
+        (magic, version, state, gen, poff, plen, rlen, readers, chk, mdl, pfx, wid,
+         lockptr) = _ENTRY.unpack(raw)
         if magic != MAGIC or version != 1:
             raise ValueError("not a VAMP entry record")
         return cls(
@@ -433,6 +489,7 @@ class EntryRecord:
             mdl.rstrip(b"\0").decode(),
             pfx.rstrip(b"\0").decode(),
             wid.rstrip(b"\0").decode(),
+            lockptr,
         )
 
 
@@ -527,10 +584,14 @@ class CxlSharedKVStore(SharedKVStore):
         return f"{self.namespace}:kv:{ident[:32]}"
 
     def _read_entry(self, entry: _Entry) -> EntryRecord:
+        # non-coherent shared memory: drop possibly stale local lines first
+        self.api.refresh(entry.header_ptr, _ENTRY.size)
         return EntryRecord.unpack(self.api.read(entry.header_ptr, _ENTRY.size))
 
     def _write_entry(self, entry: _Entry, rec: EntryRecord) -> None:
         self.api.write(entry.header_ptr, rec.pack())
+        # push the record out before the lock is released / the key is published
+        self.api.fence(entry.header_ptr, _ENTRY.size)
 
     def _next_generation(self) -> int:
         self.api.lock_acquire(self._dir_lock)
@@ -553,9 +614,17 @@ class CxlSharedKVStore(SharedKVStore):
         ptr = self.api.get(key)
         if ptr is None:
             return None
-        # entry created by another writer in this pool: adopt read-only view
+        # entry created by another writer in this pool: adopt a read-only view.
+        # The record carries the provider lock handle value, so a foreign reader
+        # can take the same entry lock (confirmed cross-host in solab/cxl_ping.c).
+        self.api.refresh(ptr, _ENTRY.size)
         rec = EntryRecord.unpack(self.api.read(ptr, _ENTRY.size))
-        entry = _Entry(key, ptr, self.api.get_ptr(rec.payload_offset), lock=None)
+        entry = _Entry(
+            key,
+            ptr,
+            self.api.get_ptr(rec.payload_offset),
+            lock=rec.lockptr if rec.lockptr else None,
+        )
         self._entries[prefix] = entry
         return entry
 
@@ -580,14 +649,16 @@ class CxlSharedKVStore(SharedKVStore):
         if self._occupied + rounded > self.capacity.payload_capacity_bytes:
             return ReserveResult(ReserveStatus.REJECTED_CAPACITY)
         try:
-            payload_ptr = self.api.shmalloc(rounded)
+            payload_ptr = self.api.payload_alloc(rounded)
         except MemoryError:
             return ReserveResult(ReserveStatus.REJECTED_CAPACITY)
         rel = self.api.get_offset(payload_ptr)
         try:
+            # the provider allocator spans the whole 128 GiB mapping; our slice
+            # is 64 GiB, so offset+len must be checked here, not trusted
             self.mapper.check_range(rel, rounded)
         except OffsetError:
-            self.api.shfree(payload_ptr)
+            self.api.payload_free(payload_ptr, rounded)
             return ReserveResult(ReserveStatus.REJECTED_BOUNDS)
         generation = self._next_generation()
         header_ptr = self.api.shmalloc(_ENTRY.size)
@@ -605,6 +676,7 @@ class CxlSharedKVStore(SharedKVStore):
             model_digest(prefix),
             prefix_digest(prefix),
             writer_id,
+            lockptr=int(lock),
         )
         self.api.write(header_ptr, rec.pack())
         self.api.put(self._key(prefix), header_ptr)
@@ -797,7 +869,7 @@ class CxlSharedKVStore(SharedKVStore):
         # The payload buffer is a separate shmalloc and is ours to free.
         self.api.lock_free(entry.lock)
         self.api.destroy(entry.key)
-        self.api.shfree(entry.payload_ptr)
+        self.api.payload_free(entry.payload_ptr, rec.rounded_len)
         self._occupied -= rec.rounded_len
         del self._entries[prefix]
 

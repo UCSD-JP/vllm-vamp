@@ -278,7 +278,22 @@ reader: `cxl_shm_connect` → `cxl_shm_get` → 레코드 refresh → `cxl_lock_
 - 다른 노드가 만든 lock을 lockptr로 재구성해 acquire 성공 → `FOREIGN_ENTRY_LOCK_UNAVAILABLE` 해소 경로 실증.
 - 할당은 payload arena 시작(1 GiB)부터 상향 — 모두 64 GiB 안(검사 통과).
 - 통과 조건 대비: startup 절차 ✅, offset 경계 ✅(allocator 객체만, 64 GiB 검사), lock/visibility ✅(cross-host lock + fence/refresh 후 checksum 일치), generation ✅(레코드 gen 전달·확인; 다중 generation 교체 시나리오는 G-F에서).
-- 미측정: refresh 없이 읽었을 때 stale이 실제로 관측되는지(negative test) — G-F 전에 `--no-refresh` 변형으로 1회 확인 권장.
+### ctypes 바인딩 실장비 검증 (`solab/cxl_pyping.py`, `vamp_cxl.cxl_shm_binding.CtypesProviderApi` + `solab/cxl_abi_solab.py` confirmation)
+
+서명 19개(connect/finalize/is_initialized/shmalloc/shfree/shm_payload_alloc/free/put/get/destroy/get_offset/get_ptr/allocate_lock(uint64*)/free_lock/lock_acquire/lock_release(uint64 값)/clwb_region_with_barrier/clflush_region_with_mfence/sfence)를 헤더·`nm -D`·C ping으로 확인 후 confirmation에 등록, 노드별 라이브러리 sha256 고정.
+
+| 단계 | 결과 |
+| --- | --- |
+| s2 `write` 64 MiB seed 11 | WRITE_OK, payload_off 2,215,641,088, lockptr 0xA000008403000, write 36 ms, fence 5.0 ms |
+| s1 `read` (refresh) | **READ_OK** gen 1, lock 대기 0, refresh 6.2 ms |
+| s2 `rewrite` 같은 payload seed 12 → gen 2 | REWRITE_OK |
+| s1 `read --no-refresh` | **READ_MISMATCH**: local `4f36899b…` ≠ remote `669fc7b3…`이며 구버전 `a54a738e…`도 아님 → **로컬 캐시 라인 일부만 stale인 혼합 상태** = 비-coherent 경로에서 refresh 필수임을 실증 |
+| s1 `read` (refresh) | **READ_OK** gen 2 |
+| s1 Python reader ← C writer `VAMP_PING` 1 GiB | **READ_OK** — C/Python 레코드 레이아웃·lock 재구성 상호운용 |
+
+(read+checksum 5 s/64 MiB, 58 s/1 GiB는 Python fnv1a 루프 비용이며 CXL 지연이 아니다; 실제 KV 이동은 memmove/numpy 경로를 쓴다.)
+
+바인딩 변경: `EntryRecord`에 `lockptr` 추가 → foreign 항목을 `_lookup`이 lock과 함께 채택(`FOREIGN_ENTRY_LOCK_UNAVAILABLE` 해소, 에뮬레이션 테스트 `test_foreign_ready_entry_is_readable_via_record_lockptr`), payload는 `shm_payload_alloc`(payload arena), `_read_entry`/`_write_entry`가 refresh/fence 수행, 64 GiB 경계는 `OffsetMapper.check_range`.
 
 ## 다른 gate
 

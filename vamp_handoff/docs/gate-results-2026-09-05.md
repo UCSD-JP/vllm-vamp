@@ -366,6 +366,8 @@ A 쪽은 세 arm 모두 turn 0 = 4.21–4.26 s(cold), turn 1–2 = 0.53–0.54 s
 
 **읽는 법(n=1, 관측값)**: 이득 조건 `남은 준비 대기 + restore < 재계산`. **직접 확인한 것**: B2(CXL)는 gap 0 s에서 손해(8.58 > 4.21), gap 5 s에서 이득(3.19 < 4.30); B1(TCP prototype)은 gap 10 s에서 손해(17.98 > 4.31), gap 35 s에서 이득(0.64). **비용식으로 추정한 경계**(gap ≈ hook − (재계산 − restore), 실측 아님): CXL 약 4 s(7.6 − 3.65), TCP 약 23.5 s(27.1 − 3.65) — Codex 사전 예상 3.6 / 22.7 s와 같은 자릿수.
 
+**B1 링크 확인(2026-09-06)**: TCP arm의 경로는 s1 EngineCore → s2 PayloadReceiver(7102)로, s1↔s2 private 링크 `ens7f1`(Intel igb, **1000 Mb/s, MTU 1500**)을 탄다. 2,099,773,440 B / 20.8 s ≈ 101 MB/s = 1 GbE 이론치(~117 MB/s)의 86% → **B1의 준비 비용은 링크 대역폭 지배**이며 sha256을 빼도 크게 줄지 않는다. 양 노드에 `ens1f0np0/np1`(고속 포트로 추정, operstate down, 미연결)이 있어 B1은 데이터센터 네트워크의 대표치가 아니라 "이 testbed의 1 GbE 경로"로만 읽어야 한다.
+
 **계측 보정(Codex 감사, 2026-09-06)**: gap1 runner는 지표를 예정 도착(t0+gap)이 아니라 실제 wakeup부터 재서 4–35 ms가 빠졌다(`보정 지연 = arrival_to_done + arrival_after_t0_s − gap_s`; 예: gap 35 s의 B1/B2 = 0.642→0.677, 0.663→0.698). 위 표는 미보정 원값이며 결론에 영향 없음. 이후 runner(`gc_cell.py`, `2c80abbaa` 이후 수정)는 monotonic clock·예정 도착 기준·`wakeup_late_s` 별도 기록·hook 종료는 10 ms 폴링 관측으로 변경(gap2 종료 후 배포). gap1/gap2 대조는 같은 예정 도착 기준으로 보정해 개별 값·범위만 제시(p99·통계적 동등성 주장 금지). gap ≥ hook이면 두 경로는 구별되지 않는다(0.64 vs 0.66). **주장 아님**: 정책 우위나 일반적 CXL-대-네트워크 성능 주장이 아니라 경로 비용 자릿수와 WAIT 정책의 손익 경계 1점 관측. TCP prototype은 8 MiB chunk 단일 스트림. 다음 = 반복 측정(≥3), 이후 "늦은 import와 재계산 병행" 정책.
 
 **정리 순서 수정(Codex, `195e9c2e0`)**: `hook_common.cleanup_and_verify`가 B cleanup 거절 시 A cleanup을 호출하지 않고(A lock/key/payload 보존) gate 실패로 종료. 이번 12셀·이전 성공 셀은 모두 B cleanup ok였으므로 결과 무효 아님.

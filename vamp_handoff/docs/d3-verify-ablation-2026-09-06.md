@@ -42,6 +42,35 @@ does establish that the verification implementation, not the CXL/DMA path, set
 the previous break-even, and that a cheap GPU-side integrity check moves the
 break-even below gap=0 for this prefix size.
 
+## Staged CXL Path, Same Ablation (heavy48 checkpoint path)
+
+The staged path (A CPU tier -> CXL -> B CPU tier -> GPU restore, the path used by
+the Heavy-48 checkpoint) with the same 2.2 GB prefix, gap=0:
+
+| Staged verify | Hook wall | Arrival->done | Source breakdown |
+| --- | ---: | ---: | --- |
+| SHA-256 | 6.128 s | 6.765 s | gather 0.87 s, CXL write 0.19 s, fence 0.16 s, sha256 1.08 s (+dest sha256 ~1.9 s) |
+| none | 3.409 s | 4.050 s | gather 1.56 s, CXL write 0.23 s, fence 0.16 s, sha256 0 |
+
+Combined picture at gap=0, arrival-to-response-complete, ~2.2 GB, one measurement:
+
+| Path / verify | Arrival->done |
+| --- | ---: |
+| Direct gpu64 | 2.28 s |
+| Direct none | 2.31 s |
+| Staged none | 4.05 s |
+| Recompute B0 | 4.71 s |
+| Staged SHA-256 | 6.77 s |
+| Direct SHA-256 | 13.06 s |
+
+Reading: host-side SHA-256 dominated preparation on both paths. With verification
+removed or made GPU-cheap, **direct GPU->CXL->GPU migration is about half of
+recompute at gap=0 (2.3 vs 4.7 s), while staged CXL only ties recompute
+(4.05 vs 4.71 s)** because staged additionally pays a CPU-tier gather (~0.9 s),
+a CXL->CPU copy (~0.66 s) and a CPU->GPU restore. The benefit is in the direct
+GPU-CXL DMA plus a cheap GPU-side integrity check, not in the staged path. n=1
+each; not a distribution or a policy claim.
+
 ## Raw
 
 - s2: `/home/ucsd/vamp/d3_results/verify_20260906T074532/`

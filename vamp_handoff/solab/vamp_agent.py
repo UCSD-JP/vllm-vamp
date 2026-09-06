@@ -28,7 +28,7 @@ import socket
 import sys
 import threading
 import time
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from vamp_cxl import vllm_binding as _b
 from vamp_cxl.keys import JobId
@@ -37,9 +37,24 @@ from vamp_cxl.network_transport import NetworkJob, PayloadReceiver, TcpPayloadTr
 # CXL path (G-F): provider library via our ctypes binding; loaded lazily on first use.
 _CXL_LIB = os.environ.get("CXL_SHM_LIBRARY")
 _CXL = {"api": None}
+# The provider keeps its rank identity (my_id) in thread-local storage: a lock or
+# allocator call from any thread other than the one that ran cxl_shm_init sees id
+# -1 and aborts the whole EngineCore after the lock timeout (observed 2026-09-06,
+# cleanup on a second RPC thread). Every provider call therefore runs on this one
+# long-lived thread; the control server hands CXL commands to it and waits.
+_CXL_THREAD_PREFIX = "vamp-cxl"
+_CXL_EXEC = ThreadPoolExecutor(max_workers=1, thread_name_prefix=_CXL_THREAD_PREFIX)
+
+
+def _cxl_run(fn, *args, **kwargs):
+    if threading.current_thread().name.startswith(_CXL_THREAD_PREFIX):
+        return fn(*args, **kwargs)
+    return _CXL_EXEC.submit(fn, *args, **kwargs).result()
 
 
 def _cxl_api():
+    if not threading.current_thread().name.startswith(_CXL_THREAD_PREFIX):
+        raise RuntimeError("provider calls must run on the vamp-cxl thread (my_id is thread-local); use _cxl_run")
     if _CXL["api"] is None:
         if not _CXL_LIB:
             raise RuntimeError("CXL_SHM_LIBRARY not set")
@@ -385,7 +400,7 @@ def _cxl_import_advance():
             S.commit_future = mgr.commit_import_async(res, False); _log("cxl_import_failed", error=S.error); return
         pptr = api.get_ptr(rec.payload_off)
         t0 = time.time(); api.refresh(pptr, rec.nbytes); S.timings["refresh_s"] = round(time.time() - t0, 3)
-        view = memoryview((ctypes.c_char * rec.nbytes).from_address(pptr)).cast("B")  # zero-copy view of CXL
+        view = memoryview((ctypes.c_char * rec.nbytes).from_address(pptr)).cast("B")  # view of the CXL mapping; import_payload copies it into the CPU tier
         t0 = time.time(); digest = hashlib.sha256(view).digest(); S.timings["sha256_s"] = round(time.time() - t0, 3)
         if digest != rec.sha256:
             S.stage, S.error = "failed", f"checksum mismatch after refresh: {digest.hex()} != {rec.sha256.hex()}"
@@ -430,13 +445,13 @@ def _handle(conn):
                 _advance_import(); out = {"ok": True, "stage": STATE.import_stage, "error": STATE.import_error,
                                            "reservation_blocks": None if STATE.import_reservation is None else len(STATE.import_reservation.block_ids)}
             elif cmd == "cxl_export":
-                out = _cxl_export(req["key"])
+                out = _cxl_run(_cxl_export, req["key"])
             elif cmd == "cxl_import_prepare":
-                out = _cxl_import_prepare(req["key"], req.get("inject"))
+                out = _cxl_run(_cxl_import_prepare, req["key"], req.get("inject"))
             elif cmd == "cleanup":
-                out = _cleanup(req.get("scope", "all"), bool(req.get("confirmed", False)))
+                out = _cxl_run(_cleanup, req.get("scope", "all"), bool(req.get("confirmed", False)))
             elif cmd == "cxl_import_status":
-                _cxl_import_advance()
+                _cxl_run(_cxl_import_advance)
                 out = {"ok": True, "stage": CXL_IMPORT.stage, "error": CXL_IMPORT.error, "timings": CXL_IMPORT.timings,
                        "reservation_blocks": None if CXL_IMPORT.reservation is None else len(CXL_IMPORT.reservation.block_ids)}
             elif cmd == "hashes":

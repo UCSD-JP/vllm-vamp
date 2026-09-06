@@ -74,6 +74,7 @@ void cxl_shm_lock_release(cxl_lock_t lock);     // by value
 - `lockptr`은 lock 워드의 offset이므로 우리 metadata 레코드에 8바이트로 저장하면 다른 노드가 `cxl_lock_t{lockptr}`로 재구성해 acquire 가능 → **cross-host READY 항목 읽기 거부(`FOREIGN_ENTRY_LOCK_UNAVAILABLE`)의 해소 경로**: `_lookup`이 채택한 foreign entry의 lock을 레코드의 lockptr로 복원.
 - lock 매직 `"CXL_LOCK"`(0x43584c5f4c4f434b)이 lock 워드 검증에 쓰임. 중재는 node 0의 lock thread(`locksys`)가 담당하므로 **manager가 죽으면 acquire가 진행되지 않는다**(실측 필요).
 - `cxl_shm_destroy(key)` 전에 `shfree` 금지, 객체 안에 lock을 넣었다면 `cxl_shm_free_lock` 먼저(헤더 주석). `cxl_shm_get_locked`는 hash_lookup + off_is_valid만 호출(추가 lock 획득 없음) — 우리는 쓰지 않는다.
+- **⚠️ 스레드 친화성 (실측 2026-09-06)**: `my_id`는 `__thread`(TLS)라 `cxl_shm_connect`를 호출한 스레드에서만 유효하다. 다른 스레드에서 lock/할당자 호출(`cxl_shm_free_lock`, `cxl_shm_destroy`, `shm_payload_free` 등)을 하면 라이브러리가 `[-1:-1:-1]`로 lock 요청을 내고 lock thread가 승인하지 않아 **lock timeout(약 480 s) 후 abort → 호출 프로세스 전체가 죽는다**(EngineCore crash 1회, 격리 재현 1회: `[-1:-1:-1] global_lock_acquire req bit must be cleared`, core dump). `get_ptr/refresh/read`처럼 TLS를 안 보는 호출은 다른 스레드에서도 동작해 초기 G-F(gf2)는 통과했으나 우연이었다. **규칙: 프로세스당 provider 호출 스레드 1개**(agent는 `ThreadPoolExecutor(max_workers=1)` `vamp-cxl` 스레드로 직렬화하고, 다른 스레드에서 `_cxl_api()`를 부르면 Python 예외로 차단). 보너스로 "한 번에 전송 1건" 직렬화도 이 스레드에서 자연히 성립.
 
 ## 5. 객체 API 동작 모델
 

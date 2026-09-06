@@ -152,10 +152,15 @@ def _status():
         "payload_received": None if STATE.payload is None else {"nbytes": STATE.payload.nbytes, "complete": STATE.payload.complete, "error": STATE.payload.error},
         "export_result": STATE.export_result,
         "payload_port": None if _RECEIVER is None else _RECEIVER.address[1],
+        # cleanup-gate fields (review 2026-09-06): everything a finished cell must have released
+        "cxl_import_stage": CXL_IMPORT.stage,
+        "cxl_export_held": None if STATE.cxl_export is None else {
+            "key": STATE.cxl_export["key"], "nbytes": STATE.cxl_export["nbytes"], "lock_freed": STATE.cxl_export.get("lock_freed", False)},
+        "received_queue": None if _RECEIVER is None else _RECEIVER.received.qsize(),
     }
 
 
-def _export(host, port):
+def _export(host, port, inject_fail_chunk=None):
     br = _b.current_bridge()
     lease = STATE.candidate
     if lease is None or br is None:
@@ -167,6 +172,10 @@ def _export(host, port):
     tr = TcpPayloadTransport()
     job = NetworkJob(JobId("gd-export"), memoryview(payload), (host, int(port)), 1, _CHUNK)
     tr.submit(job)
+    if inject_fail_chunk is not None:
+        # failure injection after the destination reserved: the sender stops with an error
+        # marker at this chunk, so B receives a partial payload and must abort + discard it
+        tr.inject_failure(job.job_id, int(inject_fail_chunk))
     t1 = time.time()
     tr.start(job.job_id)
     tr.wait(job.job_id, timeout_s=600)
@@ -314,11 +323,17 @@ def _cleanup(scope, confirmed):
             if not confirmed:
                 return {"ok": False, "error": "export cleanup requires confirmed=true (destination done)"}
             api = _cxl_api()
-            api.lock_free(ex["lock"])
+            if not ex.get("lock_freed"):
+                api.lock_free(ex["lock"]); ex["lock_freed"] = True
             try:
                 api.destroy(ex["key"])           # owns the record memory
             except Exception as exc:  # noqa: BLE001
-                done["destroy_error"] = repr(exc)
+                # review 2026-09-06: a failed key removal must not be papered over by freeing
+                # the payload; keep every pointer for the operator and fail the cell
+                residual = {"key": ex["key"], "payload_bytes": ex["nbytes"], "payload_ptr": ex["pptr"],
+                            "hashes_ptr": ex["hptr"], "hashes_bytes": ex["hashes_len"], "lock_freed": True}
+                _log("cleanup_failed", scope=scope, error=repr(exc), residual=residual)
+                return {"ok": False, "error": f"destroy({ex['key']}) failed: {exc!r}", "residual": residual}
             api.payload_free(ex["pptr"], ex["nbytes"])
             api.shfree(ex["hptr"])
             done["cxl_freed"] = {"key": ex["key"], "payload_bytes": ex["nbytes"], "hashes_bytes": ex["hashes_len"]}
@@ -330,9 +345,28 @@ def _cleanup(scope, confirmed):
     if scope in ("import", "all"):
         S = CXL_IMPORT
         if S.stage not in ("idle", "committed", "failed"):
-            return {"ok": False, "error": f"import still in progress (stage {S.stage})"}
-        done["import_stage_reset_from"] = S.stage
+            return {"ok": False, "error": f"cxl import still in progress (stage {S.stage})"}
+        if S.commit_future is not None and not S.commit_future.done():
+            return {"ok": False, "error": f"cxl import {S.stage}: commit/abort not yet drained (nudge and retry)"}
+        # network import state (review 2026-09-06: TCP reservation / received payload were not covered)
+        if STATE.import_stage not in ("idle", "committed", "failed"):
+            return {"ok": False, "error": f"network import still in progress (stage {STATE.import_stage}); use import_abort"}
+        if STATE.commit_future is not None and not STATE.commit_future.done():
+            return {"ok": False, "error": f"network import {STATE.import_stage}: commit/abort not yet drained (nudge and retry)"}
+        done["cxl_import_stage_reset_from"] = S.stage
         S.__init__()
+        done["net_import_stage_reset_from"] = STATE.import_stage
+        done["net_payload_discarded_bytes"] = None if STATE.payload is None else STATE.payload.nbytes
+        STATE.import_hashes = None; STATE.import_future = None; STATE.import_reservation = None
+        STATE.import_stage = "idle"; STATE.import_error = None; STATE.payload = None; STATE.commit_future = None
+        n = 0
+        if _RECEIVER is not None:
+            while True:
+                try:
+                    _RECEIVER.received.get_nowait(); n += 1
+                except Exception:  # noqa: BLE001 - queue.Empty
+                    break
+        done["received_queue_discarded"] = n
         if STATE.candidate is not None and mgr is not None:   # legacy auto-pin at a destination
             mgr.release_export_lease_async(STATE.candidate)
             done["dest_pin_release_posted"] = STATE.candidate.lease_id
@@ -415,6 +449,22 @@ def _cxl_import_advance():
             S.stage, S.error = "failed", f"commit raised: {exc!r}"; _log("cxl_import_failed", error=S.error)
 
 
+def _import_abort():
+    """Controller-requested abort of a network reservation whose payload will not arrive
+    (the source transfer failed before sending anything). Posts commit(False); it takes
+    effect at the next scheduler step, so the controller nudges before cleanup."""
+    mgr = _b.current_manager()
+    _advance_import()
+    if STATE.import_stage == "reserved":
+        STATE.commit_future = mgr.commit_import_async(STATE.import_reservation, False)
+        STATE.import_stage, STATE.import_error = "failed", "aborted by controller"
+        _log("import_aborted_by_controller", n_blocks=len(STATE.import_reservation.block_ids))
+        return {"ok": True, "stage": STATE.import_stage}
+    if STATE.import_stage in ("idle", "committed", "failed"):
+        return {"ok": True, "stage": STATE.import_stage, "note": "nothing to abort"}
+    return {"ok": False, "stage": STATE.import_stage, "error": "reservation not resolved yet; nudge and retry"}
+
+
 def _release():
     mgr = _b.current_manager()
     if mgr is None or STATE.candidate is None:
@@ -438,9 +488,11 @@ def _handle(conn):
             if cmd == "status":
                 _advance_import(); out = _status()
             elif cmd == "export":
-                out = _export(req["host"], req["port"])
+                out = _export(req["host"], req["port"], req.get("inject_fail_chunk"))
             elif cmd == "import_prepare":
                 out = _import_prepare(req["hashes"])
+            elif cmd == "import_abort":
+                out = _import_abort()
             elif cmd == "import_status":
                 _advance_import(); out = {"ok": True, "stage": STATE.import_stage, "error": STATE.import_error,
                                            "reservation_blocks": None if STATE.import_reservation is None else len(STATE.import_reservation.block_ids)}

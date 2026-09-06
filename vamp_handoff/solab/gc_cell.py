@@ -23,6 +23,7 @@ P.add_argument("--prefix-words", type=int, default=1000)
 P.add_argument("--salt", required=True)
 P.add_argument("--gap-s", type=float, default=0.0, help="pause between the last A turn and the first B turn")
 P.add_argument("--hook", default="", help="shell command run during the gap (e.g. trigger the export/import)")
+P.add_argument("--post-hook", default="", help="shell command run after the B turns (e.g. release A's pin); rc!=0 -> cell invalid")
 P.add_argument("--out", default="/tmp/gc_cell.jsonl")
 args = P.parse_args()
 
@@ -68,6 +69,16 @@ for t in range(args.turns_a, args.turns_a + args.turns_b):
 with open(args.out, "w") as f:
     for r in rows:
         f.write(json.dumps(r) + "\n")
+if args.post_hook:
+    # e.g. the B0 arm releases A's auto-pin here so no arm ends with a held lease
+    import subprocess
+    t0 = time.time(); rc = subprocess.call(args.post_hook, shell=True)
+    print(json.dumps({"post_hook": args.post_hook, "rc": rc, "seconds": round(time.time()-t0, 3)}), flush=True)
+    if rc != 0:
+        with open(args.out, "a") as f:
+            f.write(json.dumps({"cell_invalid": True, "reason": f"post_hook rc={rc}"}) + "\n")
+        print(f"\n=== CELL_INVALID: post-hook failed rc={rc} | out={args.out}")
+        raise SystemExit(1)
 ok = sum(r["ok"] for r in rows)
 bad = [r for r in rows if not r["ok"] or not r.get("marker_ok")]
 print(f"\n=== {ok}/{len(rows)} ok, {len(bad)} bad (http error or marker mismatch) | A turns {args.turns_a} -> B turns {args.turns_b} | out={args.out}")

@@ -322,8 +322,21 @@ class CtypesProviderApi(ProviderApi):
         self.confirmation = confirmation
         self.lib = ctypes.CDLL(path)
         self._bound: dict[str, Any] = {}
+        # The provider keeps its rank identity in thread-local storage; a lock or
+        # allocator call from another thread aborts the whole process after the lock
+        # timeout (observed on solab 2026-09-06). The first provider call binds this
+        # object to its thread and every later call is checked against it.
+        self._owner_thread: int | None = None
 
     def _fn(self, name: str) -> Any:
+        me = threading.get_ident()
+        if self._owner_thread is None:
+            self._owner_thread = me
+        elif me != self._owner_thread:
+            raise RuntimeError(
+                f"provider call {name} from thread {me}, but this process uses the provider "
+                f"on thread {self._owner_thread} (my_id is thread-local; a cross-thread call aborts the process)"
+            )
         if name in self._bound:
             return self._bound[name]
         sig = PROPOSED_SIGNATURES[name]

@@ -235,6 +235,26 @@ G-C 대비 B 첫 턴 4.175 s → 0.641 s는 **같은 조건(순차, 12,819 tok)�
 - B agent가 import된 run을 자기 candidate로 pin했다(lease 2) — "첫 큰 READY run pin" 규칙의 부작용, 무해하나 기록.
 - Dynamo patch 미적용, vLLM 소스 무수정 유지.
 
+## G-H: calibration 프로브 (2026-09-06, endpoint A = s1, 순차 concurrency 1)
+
+spec §10 "no-queue probe": 요청을 한 건씩 보내 큐 대기를 배제했다. 값은 **응답 지연**(prefill + `/no_think` decode ≤24 tok 포함)이며 service time 근사치다.
+cell마다 `--salt`가 prefix item에 섞여 실제 prompt_tokens가 조금씩 다르다(표에 실측값 기재). restore 셀은 working set > GPU pool(97,552)로 만들어 turn 1이 **전부 CPU tier restore**임을 connector 계정으로 확인했다(GPU hit 0, connector ≈50% = turn 1 전량).
+
+| prompt tok (실측) | cold: 재계산 + eager store | GPU hit | CPU→GPU restore | 표본 |
+| --- | --- | --- | --- | --- |
+| 4,794–5,494 | **1.90 s** (med, n=26: 1.68–1.92) / 1.86 (hit 셀 t0) | **0.49 s** | **0.59 s** (med, n=26: 0.54–0.59) | `calib_350_restore3`(26×2), `calib_350_hit`(1×3) |
+| 8,962–10,262 | **3.08 s** (med, n=14: 3.05–3.33) / 3.46 (10,262 tok) | **0.52 s** | **0.59 s** (med, n=14: 0.59–0.65) | `calib_650_restore2`(14×2), `calib_650_hit` |
+| 12,817–12,825 | **4.34 s** (med, n=10: 4.26–4.41) / 4.39 | **0.54 s** | **0.64 s** (n=10: 0.637–0.645) | `calib_1000_restore`(10×2), `calib_1000_hit` |
+| 12,819 (G-D) | — | — | 0.641 s (B, import된 tier) | `gd` |
+
+network A→B (G-D 단일 표본, 12,819 tok = 801 blocks = 2,099,773,440 B): `bridge.gather` 1.27 s + TCP 21.66 s (~97 MB/s, B1 correctness prototype) = ~23 s. 4.8K/9K 표본 없음.
+CPU→CXL, CXL→GPU: **없음**(G-E/F BLOCKED).
+
+관측 정리(주장 아님): restore는 GPU hit 대비 +0.05–0.10 s 수준(0.8–2.1 GB), cold는 prompt 길이에 거의 선형(≈0.34 s/1K tok). 이 값들은 이 모델·A6000·s1 host DRAM 경로에서만 유효하며 §10대로 **측정 범위 안에서만** 보간한다.
+무효 표본: `calib_350_restore`(working set 54.9K < pool → turn 1이 GPU hit), `calib_650_restore`(혼합), `calib_350_restore2`(95.9K, 경계 → 혼합), 첫 `calib_1000_*`(salt로 prompt 16,824 tok > max_model_len → 500). raw 보존.
+
+**판정: 실제 경로별 측정값 확보(recompute / GPU hit / CPU restore 3크기, network 1점)** — frozen config 반영은 `configs/calibration_solab_2026-09-06.json`(라벨 `real`), no-oracle mock 통과는 정책 비교 단계에서.
+
 ## 다른 gate
 
 | Gate | 상태 | 비고 |
@@ -244,7 +264,7 @@ G-C 대비 B 첫 턴 4.175 s → 0.641 s는 **같은 조건(순차, 12,819 tok)�
 | G-D | **PASS** | in-engine agent + 제어 채널 + nudge로 export→TCP→import→restore end-to-end. 위 참조 |
 | G-E~G-F | NOT_RUN / **BLOCKED** | 실제 CXL 접근 — provider 확인(manager startup/clear protocol, offset origin, fence/refresh primitive, lock ABI) 전 실행 금지 |
 | G-G | **PARTIAL** | 요청 없는 gap 중 publication은 **network 목적지로 실증**(G-D hook이 양 엔진 idle 상태에서 수행); DRAM→CXL 변형은 G-E/F 승인 후 |
-| G-H | NOT_RUN | |
+| G-H | **측정 완료(부분)** | recompute/GPU hit/CPU restore ×3 크기 + network 1점. CXL 경로 없음 |
 
 ## 부수 확인
 

@@ -1,0 +1,24 @@
+{
+  "_note": "REAL probes (spec §10), solab-s1 A6000 48GB, Qwen3-14B bf16, Dynamo 0.5.0 + vLLM 0.19.0, worker VampOffloadingSpec CPU tier 64 GiB. Sequential requests (concurrency 1, no queue wait). Values are response latencies in ms (prefill + /no_think decode <= 24 tokens), medians over n samples; they approximate service time and must only be interpolated inside [4794, 12825] prefix tokens. Restore points were verified all-restore by connector accounting (GPU hits 0, connector hits = every turn-1 request). Paths without a measured value are omitted, not estimated: no CXL path exists yet (G-E/F blocked on provider confirmations). Not loadable by CalibrationTable until t_cxl_* points exist; recorded for the policy-comparison stage.",
+  "calibration_id": "solab-s1-2026-09-06-v0",
+  "source": "real",
+  "loadable_by_calibration_table": false,
+  "environment": {
+    "node": "solab-s1", "gpu": "RTX A6000 48GB", "model": "Qwen/Qwen3-14B bf16",
+    "gpu_kv_pool_tokens": 97552, "cpu_tier_bytes": 68719476736, "offloaded_block_tokens": 16,
+    "bytes_per_offloaded_block": 2621440, "concurrency": 1, "max_output_tokens": 24
+  },
+  "points": [
+    {"prefix_tokens": 4794, "prefix_tokens_range": [4794, 5494], "t_recompute_ms": 1898.0, "t_recompute_n": 26,
+     "t_gpu_hit_ms": 494.0, "t_gpu_hit_n": 2, "t_cpu_restore_ms": 587.0, "t_cpu_restore_n": 26,
+     "cells": ["calib_350_restore3", "calib_350_hit"]},
+    {"prefix_tokens": 8962, "prefix_tokens_range": [8962, 10262], "t_recompute_ms": 3080.0, "t_recompute_n": 14,
+     "t_gpu_hit_ms": 518.0, "t_gpu_hit_n": 2, "t_cpu_restore_ms": 589.0, "t_cpu_restore_n": 14,
+     "cells": ["calib_650_restore2", "calib_650_hit"]},
+    {"prefix_tokens": 12818, "prefix_tokens_range": [12817, 12825], "t_recompute_ms": 4338.0, "t_recompute_n": 10,
+     "t_gpu_hit_ms": 539.0, "t_gpu_hit_n": 2, "t_cpu_restore_ms": 641.0, "t_cpu_restore_n": 10,
+     "t_net_ms": 22933.0, "t_net_n": 1, "t_net_detail": {"gather_ms": 1271.0, "tcp_send_ms": 21662.0, "bytes": 2099773440, "blocks": 801, "approx_MBps": 97},
+     "cells": ["calib_1000_restore", "calib_1000_hit", "gd"]}
+  ],
+  "raw": "asplos_paper/solab_testbed/results/ga_2026-09-05/calib_*_runner.jsonl, calib_*_s1_wstats.jsonl, gd_*"
+}

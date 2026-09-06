@@ -19,6 +19,8 @@ export VAMP_PROBE_FILE="$LOGD/probe_${TAG}.jsonl"
 # in-engine agent (G-D): control + payload ports per worker; pin the first READY run >= 64 blocks
 case "$TAG" in s1) export VAMP_AGENT_PORT=7001 VAMP_PAYLOAD_PORT=7101;; s2) export VAMP_AGENT_PORT=7002 VAMP_PAYLOAD_PORT=7102;; esac
 export VAMP_PIN_MIN_BLOCKS="${PIN_MIN:-64}"
+# CXL path (G-F): node-specific provider library through our symlink dir (s2->N0, s1->N1)
+export CXL_SHM_LIBRARY="$HOME/vamp/cxl/lib/libcxl_shm.so"
 SPEC_MODULE="${SPEC_MODULE:-vamp_agent}"
 CPU_BYTES=$(( CPU_GB * 1024 * 1024 * 1024 ))
 KVCFG="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_module_path\":\"$SPEC_MODULE\",\"spec_name\":\"VampOffloadingSpec\",\"cpu_bytes_to_use\":$CPU_BYTES,\"block_size_factor\":2,\"eviction_policy\":\"lru\"}}"

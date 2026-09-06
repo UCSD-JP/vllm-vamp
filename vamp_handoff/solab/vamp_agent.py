@@ -20,9 +20,12 @@ valid here). It extends the probe (file log) with:
 Scope: one candidate, one transfer at a time, no cancellation; on any error
 the stage is recorded and the caller aborts the cell.
 """
+import ctypes
+import hashlib
 import json
 import os
 import socket
+import sys
 import threading
 import time
 from concurrent.futures import Future
@@ -30,6 +33,26 @@ from concurrent.futures import Future
 from vamp_cxl import vllm_binding as _b
 from vamp_cxl.keys import JobId
 from vamp_cxl.network_transport import NetworkJob, PayloadReceiver, TcpPayloadTransport, sha256_hex
+
+# CXL path (G-F): provider library via our ctypes binding; loaded lazily on first use.
+_CXL_LIB = os.environ.get("CXL_SHM_LIBRARY")
+_CXL = {"api": None}
+
+
+def _cxl_api():
+    if _CXL["api"] is None:
+        if not _CXL_LIB:
+            raise RuntimeError("CXL_SHM_LIBRARY not set")
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from vamp_cxl.cxl_shm_binding import CtypesProviderApi
+        from cxl_abi_solab import solab_confirmation
+        api = CtypesProviderApi(solab_confirmation(_CXL_LIB), library_path=_CXL_LIB)
+        api.connect()  # this EngineCore process becomes a rank on its node
+        _CXL["api"] = api
+        _log("cxl_connected", lib=_CXL_LIB)
+    return _CXL["api"]
 
 _PATH = os.environ.get("VAMP_PROBE_FILE")
 _LOCK = threading.Lock()
@@ -203,6 +226,125 @@ def _advance_import():
             _log("import_failed", error=STATE.import_error)
 
 
+class CxlImportState:
+    def __init__(self):
+        self.key = None
+        self.rec = None
+        self.hashes = None
+        self.future = None
+        self.reservation = None
+        self.commit_future = None
+        self.stage = "idle"
+        self.error = None
+        self.timings = {}
+
+
+CXL_IMPORT = CxlImportState()
+
+
+def _cxl_export(key):
+    """A side: copy the pinned prefix run into the CXL payload arena and publish it."""
+    import cxl_kv_record as R
+    br = _b.current_bridge(); lease = STATE.candidate
+    if lease is None or br is None:
+        return {"ok": False, "error": "no candidate or bridge"}
+    api = _cxl_api()
+    t = {}
+    t0 = time.time(); payload = br.gather(lease.block_ids); t["gather_s"] = round(time.time() - t0, 3)
+    n = len(payload)
+    t0 = time.time(); pptr = api.payload_alloc(n); t["payload_alloc_s"] = round(time.time() - t0, 3)
+    poff = api.get_offset(pptr)
+    if poff + n > 64 * 1024**3:  # our slice is 64 GiB; the provider arena spans 128 GiB
+        api.payload_free(pptr, n)
+        return {"ok": False, "error": f"payload would cross the 64 GiB slice (off {poff}, n {n})"}
+    t0 = time.time()
+    src = (ctypes.c_char * n).from_buffer(payload)
+    ctypes.memmove(pptr, src, n)
+    t["cxl_write_s"] = round(time.time() - t0, 3)
+    t0 = time.time(); api.fence(pptr, n); t["fence_s"] = round(time.time() - t0, 3)
+    t0 = time.time(); digest = hashlib.sha256(payload).digest(); t["sha256_s"] = round(time.time() - t0, 3)
+    blob = R.pack_hashes(STATE.candidate_hashes)
+    hptr = api.shmalloc(len(blob)); api.write(hptr, blob); api.fence(hptr, len(blob))
+    rptr = api.shmalloc(R.SIZE); lock = api.lock_alloc()
+    rec = R.KvRecord(1, n, len(lease.block_ids), br.block_bytes, lock, poff, api.get_offset(hptr), len(blob), R.STATE_READY, digest)
+    api.lock_acquire(lock)
+    api.write(rptr, rec.pack()); api.fence(rptr, R.SIZE)
+    api.lock_release(lock)
+    api.put(key, rptr)
+    res = {"ok": True, "key": key, "nbytes": n, "n_blocks": len(lease.block_ids), "payload_off": poff,
+           "hashes_off": rec.hashes_off, "lockptr": lock, "sha256": digest.hex(), **t}
+    STATE.export_result = res
+    _log("cxl_export_done", **res)
+    return res
+
+
+def _cxl_import_prepare(key):
+    """B side: read the record + hashes under the entry lock, post the reservation."""
+    import cxl_kv_record as R
+    mgr = _b.current_manager()
+    if mgr is None:
+        return {"ok": False, "error": "no manager"}
+    api = _cxl_api()
+    rptr = api.get(key)
+    if not rptr:
+        return {"ok": False, "error": f"key {key} not found"}
+    api.refresh(rptr, R.SIZE)
+    rec = R.KvRecord.unpack(api.read(rptr, R.SIZE))
+    api.lock_acquire(rec.lockptr)
+    try:
+        api.refresh(rptr, R.SIZE)
+        rec = R.KvRecord.unpack(api.read(rptr, R.SIZE))
+        if rec.state != R.STATE_READY or not rec.consistent():
+            return {"ok": False, "error": f"record not READY/consistent: {rec}"}
+        hptr = api.get_ptr(rec.hashes_off)
+        api.refresh(hptr, rec.hashes_len)
+        blob = api.read(hptr, rec.hashes_len)
+    finally:
+        api.lock_release(rec.lockptr)
+    from vllm.v1.core.kv_cache_utils import BlockHash
+    CXL_IMPORT.__init__()
+    CXL_IMPORT.key, CXL_IMPORT.rec = key, rec
+    CXL_IMPORT.hashes = [BlockHash(h) for h in R.unpack_hashes(blob, rec.n_blocks)]
+    CXL_IMPORT.future = mgr.reserve_import_async(list(CXL_IMPORT.hashes))
+    CXL_IMPORT.stage = "reserve_posted"
+    _log("cxl_import_reserve_posted", key=key, n_blocks=rec.n_blocks, nbytes=rec.nbytes)
+    return {"ok": True, "stage": CXL_IMPORT.stage, "n_blocks": rec.n_blocks, "nbytes": rec.nbytes}
+
+
+def _cxl_import_advance():
+    import cxl_kv_record as R
+    S = CXL_IMPORT; br = _b.current_bridge(); mgr = _b.current_manager(); api = _cxl_api()
+    if S.stage == "reserve_posted" and S.future is not None and S.future.done():
+        try:
+            res = S.future.result()
+        except Exception as exc:  # noqa: BLE001
+            S.stage, S.error = "failed", f"reserve raised: {exc!r}"; _log("cxl_import_failed", error=S.error); return
+        if res is None:
+            S.stage, S.error = "failed", "reserve_import returned None"; _log("cxl_import_failed", error=S.error); return
+        S.reservation = res; S.stage = "reserved"
+        _log("cxl_import_reserved", n_blocks=len(res.block_ids), evicted=len(res.evicted), to_store=len(res.block_hashes))
+    if S.stage == "reserved":
+        rec = S.rec; res = S.reservation
+        if len(res.block_hashes) != rec.n_blocks or rec.block_bytes != br.block_bytes:
+            S.stage, S.error = "failed", f"layout mismatch: to_store {len(res.block_hashes)} vs {rec.n_blocks}, block_bytes {rec.block_bytes} vs {br.block_bytes}"
+            S.commit_future = mgr.commit_import_async(res, False); _log("cxl_import_failed", error=S.error); return
+        pptr = api.get_ptr(rec.payload_off)
+        t0 = time.time(); api.refresh(pptr, rec.nbytes); S.timings["refresh_s"] = round(time.time() - t0, 3)
+        view = memoryview((ctypes.c_char * rec.nbytes).from_address(pptr)).cast("B")  # zero-copy view of CXL
+        t0 = time.time(); digest = hashlib.sha256(view).digest(); S.timings["sha256_s"] = round(time.time() - t0, 3)
+        if digest != rec.sha256:
+            S.stage, S.error = "failed", f"checksum mismatch after refresh: {digest.hex()} != {rec.sha256.hex()}"
+            S.commit_future = mgr.commit_import_async(res, False); _log("cxl_import_failed", error=S.error); return
+        t0 = time.time(); br.import_payload(res.block_ids, view); S.timings["cxl_to_cpu_s"] = round(time.time() - t0, 3)
+        S.commit_future = mgr.commit_import_async(res, True); S.stage = "commit_posted"
+        _log("cxl_import_written", nbytes=rec.nbytes, **S.timings)
+    if S.stage == "commit_posted" and S.commit_future is not None and S.commit_future.done():
+        try:
+            S.commit_future.result(); S.stage = "committed"; _log("cxl_import_committed", n_blocks=len(S.reservation.block_ids), **S.timings)
+        except Exception as exc:  # noqa: BLE001
+            S.stage, S.error = "failed", f"commit raised: {exc!r}"; _log("cxl_import_failed", error=S.error)
+
+
 def _release():
     mgr = _b.current_manager()
     if mgr is None or STATE.candidate is None:
@@ -232,6 +374,14 @@ def _handle(conn):
             elif cmd == "import_status":
                 _advance_import(); out = {"ok": True, "stage": STATE.import_stage, "error": STATE.import_error,
                                            "reservation_blocks": None if STATE.import_reservation is None else len(STATE.import_reservation.block_ids)}
+            elif cmd == "cxl_export":
+                out = _cxl_export(req["key"])
+            elif cmd == "cxl_import_prepare":
+                out = _cxl_import_prepare(req["key"])
+            elif cmd == "cxl_import_status":
+                _cxl_import_advance()
+                out = {"ok": True, "stage": CXL_IMPORT.stage, "error": CXL_IMPORT.error, "timings": CXL_IMPORT.timings,
+                       "reservation_blocks": None if CXL_IMPORT.reservation is None else len(CXL_IMPORT.reservation.block_ids)}
             elif cmd == "hashes":
                 out = ({"ok": True, "hashes": [h.hex() for h in STATE.candidate_hashes]}
                        if STATE.candidate_hashes else {"ok": False, "error": "no candidate"})

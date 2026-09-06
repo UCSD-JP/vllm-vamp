@@ -454,5 +454,29 @@ class CtypesBindingRefusesUnconfirmed(unittest.TestCase):
         time.sleep(0)
 
 
+class SolabKvRecord(unittest.TestCase):
+    def test_record_roundtrip_and_consistency(self):
+        import sys as _sys
+        solab = str(HANDOFF / "solab")
+        if solab not in _sys.path:
+            _sys.path.insert(0, solab)
+        import cxl_kv_record as R
+
+        sha = bytes(range(32))
+        rec = R.KvRecord(3, 801 * 2621440, 801, 2621440, 0x7000008403000, 1 << 30, 140509248, 801 * 32, R.STATE_READY, sha)
+        raw = rec.pack()
+        self.assertEqual(len(raw), R.SIZE)
+        self.assertEqual(R.KvRecord.unpack(raw), rec)
+        self.assertTrue(rec.consistent())
+        bad = R.KvRecord(3, 1, 801, 2621440, 1, 0, 0, 801 * 32, R.STATE_READY, sha)
+        self.assertFalse(bad.consistent())
+        with self.assertRaises(ValueError):
+            R.KvRecord.unpack(b"\0" * R.SIZE)
+        hashes = [bytes([i]) * 32 for i in range(5)]
+        self.assertEqual(R.unpack_hashes(R.pack_hashes(hashes), 5), hashes)
+        with self.assertRaises(ValueError):
+            R.pack_hashes([b"short"])
+
+
 if __name__ == "__main__":
     unittest.main()

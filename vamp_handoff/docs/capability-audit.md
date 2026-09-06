@@ -72,3 +72,14 @@
 - cross-host visibility/fence primitive. `CxlCopyTransport`는 fence가 주입되지 않으면 VISIBLE을 내지 않는다.
 - crash recovery/fencing: 죽은 writer의 RESERVED/WRITING slot 회수 절차 미구현. 임의 timeout 회수는 하지 않는다(spec §6.8).
 - lock handle ABI: 값 전달 handle의 정확한 struct 크기/정렬 미확인. 확인 전에는 `CxlSharedKVStore`를 실제 library에 붙일 수 없다.
+
+## 2026-09-06 BLOCKED 항목 갱신 (provider 코드 분석, `docs/provider-api-findings-2026-09-06.md`)
+
+| 항목 | 상태 변경 | 근거 |
+| --- | --- | --- |
+| shared_offset_check | BLOCKED → **CONFIRMED slice-relative** | `__init_local`의 `mmap(..., offset=0x1000000000)`, `get_offset = ptr − dax_base`. `OffsetMapper(slice_len=64 GiB, provider_maps_slice_relative=True)`로 device offset 계산 허용 가능 |
+| cross_host_visibility_primitive | BLOCKED → **CONFIRMED (CPU staging 경로)** | export `clflush_region_with_mfence/sfence`, `clwb_region_with_barrier`. GPU-DMA coherence는 여전히 별개 |
+| lock handle ABI | BLOCKED → **CONFIRMED** | `cxl_lock_t = {volatile shm_ptr_t lockptr}` 8 B by value; ctypes `c_uint64` |
+| foreign READY entry 읽기 | 미해결 → **해소 경로 확정** | 레코드에 lockptr(8 B) 저장 → 타 노드가 `cxl_lock_t` 재구성. `_lookup` 채택 시 lock=None 대신 레코드 lockptr 사용(구현 예정) |
+| manager startup/clear | 미확인 → **CONFIRMED** | node0·rank0 init이 메타 138 MB zero + 10 GiB 0xAA; 재기동 금지 규칙; `cxl_clear_ucsd`=[64 GiB,128 GiB) |
+| crash recovery | BLOCKED 유지 | 데모 범위: 실패 시 clear + cold restart |

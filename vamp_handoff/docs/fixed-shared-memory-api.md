@@ -51,3 +51,12 @@ The reported UCSD device range is [64 GiB, 128 GiB). Manager coordination is on
 node 0 (s2). Actual mapping origin and startup/clear procedures still require
 operator confirmation. No automatic initialization, full-pool clear, or writes
 to other tenants' regions are permitted.
+
+## 2026-09-06 확인 결과 (코드 분석, 변경 없음)
+
+이 문서에서 "확인 필요"로 남겼던 항목은 `docs/provider-api-findings-2026-09-06.md`에서 디스어셈블로 확정했다:
+offset은 **slice-relative**(`dax_base` = 장치 64 GiB, `get_offset(p)=p−dax_base`), `off_is_valid`는 128 GiB까지 허용하므로 우리가 64 GiB 상한을 별도 검사;
+flush primitive는 `clflush_region_with_{mfence,sfence}`/`clwb_region_with_barrier`가 export됨(fence=write 후, refresh=read 전);
+lock 핸들은 8 B 값 전달(`{volatile uint64 lockptr}`), lockptr는 offset이라 노드 간 공유 가능;
+`start_server.sh`는 로컬 bootstrap shm 삭제 + node0·rank0 init(메타 138 MB zero + 10 GiB 0xAA) → **재기동 = 슬라이스 재초기화**; `cxl_clear_ucsd`는 [64 GiB,128 GiB) 전체 memset.
+남은 실측 항목: arena 레이아웃(manager stderr), lock 해제→상대 read 가시 시점, `__wait_for_init` 대기 동작.

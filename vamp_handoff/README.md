@@ -25,6 +25,8 @@ v0.20 deprecation 문구가 있다는 사실만으로 release 이후 main이라�
 4. [고정된 외부 shared-memory API 계약](docs/fixed-shared-memory-api.md).
 5. [Claude 개발 / Codex 검증 절차](docs/collaboration.md).
 6. [Read-only capability audit와 최소 backend 변경 제안](docs/capability-audit.md).
+7. [Heavy-48 window 결과](docs/heavy48-window-results.md)와
+   [실행 명세](docs/heavy48-window-spec.md): 48세션 첫 최대 8턴과 staged migration.
 
 ## 초기 검증: hash + 테스트 6개
 

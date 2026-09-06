@@ -386,6 +386,19 @@ A 쪽은 세 arm 모두 turn 0 = 4.21–4.26 s(cold), turn 1–2 = 0.53–0.54 s
 
 **읽는 법**: 직접 경로는 이 구성에서 동작한다(등록·복사·cross-host 가시성·바이트 일치). 10.7 / 7.3 GB/s는 GPU PCIe 한계(25 GB/s 실측)가 아니라 **CXL Type-3 장치 경로의 실효 처리량**이며, 단일 스레드 CPU 읽기(약 3 GB/s)보다 3.5배 높다. 이는 **DRAM-staged 경로의 CXL 구간(write 0.23+fence 0.16+refresh 0.16+CXL→DRAM 0.69 s)과 DRAM→GPU restore를 GPU DMA 0.30+0.20 s로 대체할 수 있다**는 뜻이지만, **D3(실제 KV 블록을 vLLM GPU KV 텐서에서 직접 CXL로 내보내고 B의 GPU KV 블록으로 들여와 재사용·정답 확인)은 미완**이다. 현재 agent는 CPU tier에서 gather하므로 자동으로 직접 경로가 되지 않는다. 기존 gap1/gap2·B0/B1/B2 결과는 **DRAM-staged 기준선**으로 보존.
 
+## D3 검증 비용 분리 (2026-09-06, `d3-verify-ablation-2026-09-06.md`) — 직접 경로 병목 = 검증
+
+861블록 2.26 GB, gap=0, 도착→완료, n=1, cold reset, fresh arena.
+
+| 셀 | 도착→완료 | B HTTP | export/import op | 검증 exp/imp | DMA exp/imp |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 재계산 B0 | 4.707 s | 4.570 s | – | – | – |
+| 직접 SHA-256(host readback) | 13.058 s | 0.594 s | 6.14 / 5.97 s | 5.30 / 5.37 s | 0.31 / 0.22 s |
+| 직접 gpu64(GPU 블록합) | **2.277 s** | 0.556 s | 0.78 / 0.59 s | 0.011 / 0.016 s | 0.31 / 0.21 s |
+| 직접 none(생략) | 2.311 s | 0.560 s | 0.79 / 0.62 s | 0 / 0 | 0.31 / 0.21 s |
+
+**이전 "직접 이동이 gap=0에서 재계산보다 느리다"(D3 follow-up 9.670 s)는 전적으로 SHA-256 host readback 검증(10.7 s)이었다.** DMA는 0.31+0.21 s뿐. GPU 내 블록별 64-bit 합(gpu64)은 0.01 s로 none과 동일 시간이며 블록 오배치·대량 손상은 잡는다(비암호학적; SHA-256=correctness 기준선). **gpu64로 직접 이동은 gap=0에서 재계산의 약 절반**(2.28 vs 4.71 s), B HTTP 0.56 vs 4.57 s. n=1, 정책 우위 아님.
+
 ## 다른 gate
 
 **2026-09-06 D3 follow-up (Codex)**: actual GPU KV -> registered shared CXL ->
@@ -399,6 +412,7 @@ statements above describe the earlier gates, not the current status.
 
 | Gate | 상태 | 비고 |
 | --- | --- | --- |
+| D3 검증 분리 | **완료(n=1)** | SHA-256 host readback가 직접 경로 break-even의 원인; gpu64로 gap=0서 재계산의 절반(2.28 vs 4.71 s). 위 참조 |
 | D0–D2 직접 경로 | **PASS** | 등록 ok(flag 0), 2 GiB GPU→CXL 7.3 GB/s / CXL→GPU 10.7 GB/s, cross-host 바이트 일치. D3(실 KV) 미완 |
 | Gap `gap1` | **완료(n=1, 12셀)** | 도착→완료: B0 4.2–4.3 s 상수; B2 8.58/3.19/0.65/0.66; B1 27.84/22.70/17.98/0.64 (gap 0/5/10/35). 위 참조 |
 | B0/B1/B2 | **완료(n=1)** | 동일 입력·cold reset·strict gate. B 첫 턴 4.28 / 0.64 / 0.65 s, 준비 비용 – / 26.0 / 7.0 s. 위 참조 |

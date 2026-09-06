@@ -57,6 +57,9 @@ def _cxl_api():
 _PATH = os.environ.get("VAMP_PROBE_FILE")
 _LOCK = threading.Lock()
 _PIN_MIN = int(os.environ.get("VAMP_PIN_MIN_BLOCKS", "64"))
+# Only an export source pins; a destination worker keeps its ordinary CPU cache and
+# must not hold export pins (review 2026-09-06: no side-effect pin at B).
+_PIN_ENABLED = os.environ.get("VAMP_AGENT_PIN", "1") == "1"
 _AGENT_PORT = int(os.environ.get("VAMP_AGENT_PORT", "0"))
 _PAYLOAD_PORT = int(os.environ.get("VAMP_PAYLOAD_PORT", "0"))
 _CHUNK = 8 * 1024 * 1024
@@ -87,6 +90,7 @@ class AgentState:
         self.payload = None  # ReceivedPayload
         self.commit_future: Future | None = None
         self.export_result = None
+        self.cxl_export = None  # ptrs kept for cleanup after the destination is done
 
 
 STATE = AgentState()
@@ -103,7 +107,7 @@ class AgentListener:
         _log("ready", n_blocks=len(block_hashes), ready_calls=self.ready_calls,
              ready_blocks=self.ready_blocks, hashes_head=[bytes(h).hex()[:16] for h in block_hashes[:3]])
         mgr = _b.current_manager()
-        if (STATE.candidate is None and mgr is not None and len(block_hashes) >= _PIN_MIN):
+        if (_PIN_ENABLED and STATE.candidate is None and mgr is not None and len(block_hashes) >= _PIN_MIN):
             lease = mgr.acquire_export_lease(list(block_hashes))  # owner thread: allowed
             if lease is not None:
                 STATE.candidate = lease
@@ -273,13 +277,59 @@ def _cxl_export(key):
     api.put(key, rptr)
     res = {"ok": True, "key": key, "nbytes": n, "n_blocks": len(lease.block_ids), "payload_off": poff,
            "hashes_off": rec.hashes_off, "lockptr": lock, "sha256": digest.hex(), **t}
+    # keep everything cleanup needs; freed only after the controller confirms B is done
+    STATE.cxl_export = {"key": key, "rptr": rptr, "hptr": hptr, "hashes_len": len(blob),
+                        "pptr": pptr, "nbytes": n, "lock": lock}
     STATE.export_result = res
     _log("cxl_export_done", **res)
     return res
 
 
-def _cxl_import_prepare(key):
-    """B side: read the record + hashes under the entry lock, post the reservation."""
+def _cleanup(scope, confirmed):
+    """Controller-serialized release. Export-side resources are freed only after the
+    controller confirms the destination import is committed or aborted and nothing
+    is still reading (provider contract: free locks -> destroy key -> free payload).
+    The export lease release is posted to the manager mailbox and takes effect at
+    the next scheduler step (the controller nudges)."""
+    done = {}
+    mgr = _b.current_manager()
+    if scope in ("export", "all"):
+        ex = getattr(STATE, "cxl_export", None)
+        if ex is not None:
+            if not confirmed:
+                return {"ok": False, "error": "export cleanup requires confirmed=true (destination done)"}
+            api = _cxl_api()
+            api.lock_free(ex["lock"])
+            try:
+                api.destroy(ex["key"])           # owns the record memory
+            except Exception as exc:  # noqa: BLE001
+                done["destroy_error"] = repr(exc)
+            api.payload_free(ex["pptr"], ex["nbytes"])
+            api.shfree(ex["hptr"])
+            done["cxl_freed"] = {"key": ex["key"], "payload_bytes": ex["nbytes"], "hashes_bytes": ex["hashes_len"]}
+            STATE.cxl_export = None
+        if STATE.candidate is not None and mgr is not None:
+            fut = mgr.release_export_lease_async(STATE.candidate)
+            done["lease_release_posted"] = STATE.candidate.lease_id
+            STATE.candidate = None; STATE.candidate_hashes = None
+    if scope in ("import", "all"):
+        S = CXL_IMPORT
+        if S.stage not in ("idle", "committed", "failed"):
+            return {"ok": False, "error": f"import still in progress (stage {S.stage})"}
+        done["import_stage_reset_from"] = S.stage
+        S.__init__()
+        if STATE.candidate is not None and mgr is not None:   # legacy auto-pin at a destination
+            mgr.release_export_lease_async(STATE.candidate)
+            done["dest_pin_release_posted"] = STATE.candidate.lease_id
+            STATE.candidate = None; STATE.candidate_hashes = None
+    _log("cleanup", scope=scope, **{k: v for k, v in done.items() if k != "cxl_freed"}, cxl_freed=done.get("cxl_freed"))
+    return {"ok": True, **done}
+
+
+def _cxl_import_prepare(key, inject=None):
+    """B side: read the record + hashes under the entry lock, post the reservation.
+    inject="checksum" corrupts the expected digest so the post-reservation verify fails
+    (exercises the abort/cleanup path without touching the shared data)."""
     import cxl_kv_record as R
     mgr = _b.current_manager()
     if mgr is None:
@@ -304,6 +354,11 @@ def _cxl_import_prepare(key):
     from vllm.v1.core.kv_cache_utils import BlockHash
     CXL_IMPORT.__init__()
     CXL_IMPORT.key, CXL_IMPORT.rec = key, rec
+    if inject == "checksum":
+        rec = R.KvRecord(rec.generation, rec.nbytes, rec.n_blocks, rec.block_bytes, rec.lockptr,
+                         rec.payload_off, rec.hashes_off, rec.hashes_len, rec.state, bytes(32))
+        CXL_IMPORT.rec = rec
+        _log("cxl_import_inject", inject=inject)
     CXL_IMPORT.hashes = [BlockHash(h) for h in R.unpack_hashes(blob, rec.n_blocks)]
     CXL_IMPORT.future = mgr.reserve_import_async(list(CXL_IMPORT.hashes))
     CXL_IMPORT.stage = "reserve_posted"
@@ -377,7 +432,9 @@ def _handle(conn):
             elif cmd == "cxl_export":
                 out = _cxl_export(req["key"])
             elif cmd == "cxl_import_prepare":
-                out = _cxl_import_prepare(req["key"])
+                out = _cxl_import_prepare(req["key"], req.get("inject"))
+            elif cmd == "cleanup":
+                out = _cleanup(req.get("scope", "all"), bool(req.get("confirmed", False)))
             elif cmd == "cxl_import_status":
                 _cxl_import_advance()
                 out = {"ok": True, "stage": CXL_IMPORT.stage, "error": CXL_IMPORT.error, "timings": CXL_IMPORT.timings,

@@ -5,7 +5,7 @@
 # window markers on every worker -> run the given runner command -> snapshot windows.
 # usage: gate_cell.sh <cell> <expected_instances> <worker_hosts:comma> -- <runner cmd...>
 #   e.g. gate_cell.sh gb 2 192.168.5.61,localhost -- python ~/vamp/pressure_run.py --sessions 8 ...
-set -u
+set -u -o pipefail
 CELL="${1:?cell}"; EXPECT="${2:?expected instances}"; HOSTS="${3:?worker hosts}"; shift 3
 [ "${1:-}" = "--" ] && shift
 RUNNER=("$@"); [ ${#RUNNER[@]} -gt 0 ] || { echo "runner cmd required"; exit 2; }
@@ -41,7 +41,8 @@ for h in "${HL[@]}"; do t=$(tag_of "$h")
 done
 FLOG="${FRONTEND_LOG:-$HOME/vamp/logs/frontend.log}"; FL_START=$(cat "$FLOG" 2>/dev/null | wc -l)
 echo "[cell $CELL] run: ${RUNNER[*]}"; date -u +%FT%TZ > ${OUT}_start_ts.txt
-"${RUNNER[@]}" --out ${OUT}_runner.jsonl 2>&1 | tail -6
+"${RUNNER[@]}" --out ${OUT}_runner.jsonl > ${OUT}_runner.log 2>&1; RC=$?
+tail -6 ${OUT}_runner.log
 sleep 4; date -u +%FT%TZ > ${OUT}_end_ts.txt
 for h in "${HL[@]}"; do t=$(tag_of "$h")
   WS=$(cat ${OUT}_${t}_wstats_start.txt); PS=$(cat ${OUT}_${t}_probe_start.txt)
@@ -52,3 +53,5 @@ for h in "${HL[@]}"; do t=$(tag_of "$h")
 done
 tail -n +$((FL_START+1)) "$FLOG" 2>/dev/null | grep -o "Selected worker: [0-9]*, logit: [0-9.]*, cached blocks: [0-9]*" > ${OUT}_router.txt
 echo "[cell $CELL] router decisions in window: $(wc -l < ${OUT}_router.txt)"
+echo "[cell $CELL] runner rc=$RC $([ $RC -eq 0 ] && echo CELL_OK || echo CELL_INVALID)"
+exit $RC

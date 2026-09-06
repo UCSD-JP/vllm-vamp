@@ -305,7 +305,7 @@ hook(7.3 s): A `cxl_export` → B `cxl_import_prepare` → nudge → B `cxl_impo
 | --- | --- |
 | A `cxl_export_done` | 864 blocks = **2,264,924,160 B**, payload_off 4,382,523,392(≈4.08 GiB, 64 GiB 안 — adapter 검사 통과), gather 1.50 s, **CXL write(memmove) 0.234 s (~9.7 GB/s), fence(clwb) 0.167 s**, sha256 1.57 s, 레코드 lockptr 0xC000008403000 |
 | B `cxl_import_reserved` | 864 to_store, 0 evicted (nudge #1로 drain) |
-| B `cxl_import_written` | **refresh(clflush) 0.170 s, sha256 2.545 s = A 값과 일치, CXL→CPU 0.804 s**(zero-copy view → `bridge.import_payload`) |
+| B `cxl_import_written` | **refresh(clflush) 0.170 s, sha256 2.545 s = A 값과 일치, CXL view에서 CPU tier로 복사 0.804 s**(ctypes view → `bridge.import_payload`; 복사 1회) |
 | B `cxl_import_committed` | 864 blocks; READY 이벤트 hash head `bc620938…` = A와 동일 |
 
 | turn | endpoint | latency |
@@ -320,7 +320,7 @@ A sidecar: connector 0/13,882(turn 0 cold), GPU 66.5%. 5/5 marker 정답.
 **판정: PASS** — local-cold 목적지(B)에서 shared READY prefix가 복원되어 정답 출력. checksum(A sha256 = B sha256 after refresh) 일치, 레이아웃(864 × 2,621,440) 일치, generation 1 확인.
 **1차(`gf`)는 절차상 INVALID**: 기능은 동일하게 성공(B 0.68 s, connector 99.6%)했으나 hook이 중간 단계 "reserved"만 기다려 timeout(rc 4)했고 runner가 B 턴을 진행함. 수정(`bae291922`): hook은 target 이상 단계 허용, `gc_cell.py`는 hook rc≠0 시 `cell_invalid` 기록 후 중단. raw `gf_*` 보존.
 
-관측(주장 아님): 실제 데이터 이동은 write 0.23 + fence 0.17 + refresh 0.17 + read/copy 0.80 ≈ **1.4 s / 2.26 GB**(TCP prototype 21.7 s / 2.1 GB 대비), sha256 검증 2회(A 1.6 s + B 2.5 s)가 gap 비용의 대부분. nudge 2건은 여전히 필요(idle EngineCore). 이 값들도 응답 지연/벽시계이며 통제된 성능 비교가 아니다.
+관측(주장 아님): **정책이 써야 하는 준비 비용은 hook 전체 벽시계 7.3 s**(gather 1.5 + CXL write 0.23 + fence 0.17 + sha256 1.6 + 제어/nudge + B refresh 0.17 + sha256 2.5 + 복사 0.80)이다. "1.4 s"는 그중 write/fence/refresh/복사 4단계의 합일 뿐이며 이동 비용 전체가 아니다. TCP prototype hook은 26.8 s. nudge 2건은 여전히 필요(idle EngineCore). 벽시계 값이며 통제된 성능 비교가 아니다.
 
 ## 다른 gate
 

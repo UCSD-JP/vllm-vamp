@@ -69,4 +69,9 @@ with open(args.out, "w") as f:
     for r in rows:
         f.write(json.dumps(r) + "\n")
 ok = sum(r["ok"] for r in rows)
-print(f"\n=== {ok}/{len(rows)} ok | A turns {args.turns_a} -> B turns {args.turns_b} | out={args.out}")
+bad = [r for r in rows if not r["ok"] or not r.get("marker_ok")]
+print(f"\n=== {ok}/{len(rows)} ok, {len(bad)} bad (http error or marker mismatch) | A turns {args.turns_a} -> B turns {args.turns_b} | out={args.out}")
+if bad:
+    with open(args.out, "a") as f:
+        f.write(json.dumps({"cell_invalid": True, "reason": f"{len(bad)} request(s) failed or wrong marker"}) + "\n")
+    raise SystemExit(1)

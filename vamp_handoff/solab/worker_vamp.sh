@@ -19,6 +19,8 @@ export VAMP_PROBE_FILE="$LOGD/probe_${TAG}.jsonl"
 # in-engine agent (G-D): control + payload ports per worker; pin the first READY run >= 64 blocks
 case "$TAG" in s1) export VAMP_AGENT_PORT=7001 VAMP_PAYLOAD_PORT=7101;; s2) export VAMP_AGENT_PORT=7002 VAMP_PAYLOAD_PORT=7102;; esac
 export VAMP_PIN_MIN_BLOCKS="${PIN_MIN:-64}"
+# PIN=1 only on the export source; a destination keeps its normal CPU cache but takes no export pin
+export VAMP_AGENT_PIN="${PIN:-1}"
 # CXL path (G-F): node-specific provider library through our symlink dir (s2->N0, s1->N1)
 export CXL_SHM_LIBRARY="$HOME/vamp/cxl/lib/libcxl_shm.so"
 SPEC_MODULE="${SPEC_MODULE:-vamp_agent}"

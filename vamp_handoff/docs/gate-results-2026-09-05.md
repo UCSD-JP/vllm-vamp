@@ -330,6 +330,10 @@ A sidecar: connector 0/13,882(turn 0 cold), GPU 66.5%. 5/5 marker 정답.
 | --- | --- | --- | --- |
 | `fail_wrongkey2` | B prepare에 없는 key | A export 801 blocks 2,099,773,440 B → B "not found" | A `cxl_freed` payload+hashes, leases 0/0, **gate ok**, hook 4.1 s |
 | `fail_checksum2` | reservation 후 기대 digest 오염 | reserved 864 → refresh 0.176 s → sha256 2.547 s 불일치 → abort 게시 | abort 드레인(nudge) → B idle → A `cxl_freed` 2,264,924,160 B, leases 0/0, **gate ok**, hook 5.7 s |
+| `fail_transfer` (B1, 네트워크) | reservation 후 sender가 chunk 3에서 error marker | A export `FAILED`(injected sender error) → B `import_payload_received complete=false` → stage failed, abort 게시 | nudge 드레인 → B cleanup: 수신 버퍼 2,099,773,440 B 폐기·stage idle → A lease 반납 → **strict gate ok**(failed_checks 없음), hook 7.1 s |
+| `b1_gate` (B1 정상 경로) | 없음 | TCP 2,264,924,160 B: gather 1.44 s, send 23.4 s, B committed 864 | B cleanup(committed→idle, staging 버퍼 폐기) → A lease 반납 → **strict gate ok**; transfer 29.9 s / cleanup 0.22 s 분리 기록; B 첫 턴 0.654 s, 5/5 정답 |
+
+**Strict gate(2026-09-06 리뷰 반영, `solab/hook_common.py`)**: 양쪽 cleanup RPC `ok` + A/B lease 0 + candidate 없음 + A `cxl_export_held` 없음 + B network/CXL import stage idle + B 수신 payload 버퍼·큐 비움. cleanup은 commit/abort가 드레인되기 전이면 거부하고, `destroy` 실패 시 payload를 해제하지 않고 포인터를 보존한 채 `ok=false`(셀 실패). hook 출력은 `transfer_s`(hook 시작→목적지 committed/failed)와 `cleanup_s`를 분리.
 
 **사고 1건(원인 확정·수정)**: 첫 `fail_wrongkey`에서 A cleanup이 다른 RPC 스레드에서 실행되어 provider `my_id`(TLS)가 -1 → lock timeout 480 s → **EngineCore abort**. 격리 재현 후 agent의 모든 provider 호출을 전용 스레드 1개로 직렬화(`bf589151e`, `provider-api-findings` §4). 첫 `fail_checksum`은 hook이 상태 한 번에 reserved→failed 진행을 try 밖에서 관측해 정리 없이 종료 → 수정(`dd347096f`) 후 재실행. 이슈·질문 정리 = `review-request-2026-09-06-cleanup-gate.md`.
 

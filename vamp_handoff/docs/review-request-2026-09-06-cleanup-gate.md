@@ -35,6 +35,21 @@
 5. **B0/B1/B2 비교 설계 확인 (`compare_arms.sh`, 미실행).** 동일 `--salt`(동일 토큰), 1 세션, A 3턴 → hook → B 2턴, arm마다 cold reset, 바뀌는 것은 전송 메커니즘과 CXL key만. B0는 hook 없음(gap 0) → B 첫 턴 = local-cold 재계산. **질문**: B0에 B1/B2의 hook 시간(≈7 s)과 같은 인위적 gap을 주는 arm(B0-gap)도 넣어야 "gap 자체의 영향"을 분리할 수 있는데, 1차 비교에는 B0(gap 0)만으로 갈지. 또 warm-up은 두 endpoint 모두에 넣었습니다(B 첫 요청 JIT 편향 제거) — 허용되는지.
 6. **B1 hook에 정리 게이트 추가(미실행).** `gd_hook.py`에 gf_hook과 같은 `cleanup_and_verify`(B cleanup import → A cleanup export[CXL 객체 없음, lease release] → nudge → 검증)와 실패 시 정리 경로를 넣었습니다. 네트워크 경로엔 checksum 주입 옵션이 없는데, B1도 동일 주입 매트릭스가 필요하다고 보시는지(현재 판단: CXL 경로만 공유 자원이므로 B1은 정상 경로의 정리 게이트만).
 
+## 3b. Codex 리뷰(99d9915ea) 반영 상태 — `941fb3c32`…
+
+| 지적 | 반영 | 검증 |
+|---|---|---|
+| B1 cleanup이 네트워크 상태 미정리 | `_cleanup(import)`가 network reservation/stage/payload 버퍼 초기화 + receiver 큐 드레인; commit/abort 미드레인·진행 중이면 거부(`import_abort` 명령 추가) | `b1_gate`: committed→idle, 버퍼 2.26 GB 폐기; `fail_transfer`: failed→idle, 부분 버퍼 2.10 GB 폐기 |
+| CLEANUP_GATE 거짓 성공 | strict gate 11개 검사(cleanup ok ×2, lease, candidate, cxl_export_held, net/cxl stage idle, payload 버퍼, 큐) → `failed_checks` 출력 | 4셀 모두 `failed_checks: []` |
+| destroy 실패 무시 | 실패 시 payload/hashes 해제 안 함, 포인터 residual 반환, `ok=false` → hook rc 6 → 셀 실패 | 코드 경로(실장비 재현 불가 — provider destroy 실패 조건 없음) |
+| compare_arms 계속 진행 | 첫 실패 arm에서 nonzero 종료, reset 실패도 중단 | 스크립트 |
+| ① 바인딩 thread ID 검사 | `CtypesProviderApi._fn`이 첫 호출 스레드를 기억, 다른 스레드는 `RuntimeError` | s1 실장비 `cxl_thread_guard_check.py` → `GUARD_OK` |
+| ④ cold reset 정의 | `arm_reset.sh`: worker+EngineCore만 재기동, agent+bridge 응답·etcd 인스턴스 1/1·양 endpoint 실요청 확인 후 `RESET_OK` | 1회 통과 |
+| ⑥ B1 reservation 이후 전송 실패 1건 | `gd_hook --inject transfer`(sender error marker at chunk 3) | `fail_transfer` gate ok |
+| B0의 A pin 정리 | `gc_cell --post-hook "gf_hook --cleanup-only"` (B 턴 후 A pin 반납 + gate 기록) | arm 실행에서 확인 |
+| 준비/정리 시간 분리 | hook JSON `transfer_s` / `cleanup_s` | b1_gate 29.9 / 0.22 s |
+| ③ 묶음 전 fresh start 1회 | 양 worker 정지 → `cxl_fresh_start.sh` → nid 0·lock thread 확인 → arms | 실행 중 |
+
 ## 4. 부수 사항
 
 - 표현 정정 반영: agent 주석 "zero-copy view" → "CXL 매핑 view, `import_payload`가 CPU tier로 복사".

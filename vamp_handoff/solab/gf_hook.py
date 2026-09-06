@@ -20,6 +20,7 @@ P.add_argument("--model", default="Qwen/Qwen3-14B")
 P.add_argument("--key", default=f"VAMP_KV_{int(time.time())}")
 P.add_argument("--a-url", default="http://localhost:8080/v1/chat/completions")
 P.add_argument("--inject", default=None, choices=[None, "wrong_key", "checksum"], help="failure injection for the cleanup gate")
+P.add_argument("--cleanup-only", action="store_true", help="skip export/import; only drain B's pending abort and run the serial release + gate")
 args = P.parse_args()
 
 def rpc(addr, req, timeout=900):
@@ -64,6 +65,13 @@ def wait_stage(target, budget):
         time.sleep(0.2)
     step("timeout_waiting", target=target); sys.exit(4)
 
+if args.cleanup_only:
+    # operator recovery after an aborted cell: drain B's pending abort, then the serial release
+    step("B_nudge_abort", latency_s=nudge("abort"))
+    ok = cleanup_and_verify(import_done=True)
+    print(json.dumps({"hook": "cleanup_only", "cleanup_gate_ok": ok}), flush=True)
+    sys.exit(0 if ok else 6)
+
 a = rpc(args.a_agent, {"cmd": "status"})
 step("A_status", candidate_blocks=a.get("candidate_blocks"), leases=a.get("active_leases"))
 if not a.get("candidate_blocks"): step("abort", reason="A has no pinned candidate"); sys.exit(2)
@@ -78,9 +86,11 @@ if not prep.get("ok"):
     ok = cleanup_and_verify(import_done=True)
     print(json.dumps({"hook": "failed_as_injected" if args.inject else "failed", "reason": prep.get("error"), "cleanup_gate_ok": ok}), flush=True)
     sys.exit(3)
-step("B_nudge_1", latency_s=nudge("reserve"))
-step("B_reserved", **wait_stage("reserved", 60))
 try:
+    step("B_nudge_1", latency_s=nudge("reserve"))
+    # one status call may run reserved -> refresh/sha256 -> failed, so the wait for
+    # "reserved" itself can observe the injected checksum failure: keep it inside the try
+    step("B_reserved", **wait_stage("reserved", 60))
     step("B_commit_posted", **wait_stage("commit_posted", 600))   # refresh + sha256 + CXL->CPU copy happen here
     step("B_nudge_2", latency_s=nudge("commit"))
     step("B_committed", **wait_stage("committed", 60))

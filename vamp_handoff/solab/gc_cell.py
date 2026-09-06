@@ -21,7 +21,7 @@ P.add_argument("--turns-a", type=int, default=3)
 P.add_argument("--turns-b", type=int, default=2)
 P.add_argument("--prefix-words", type=int, default=1000)
 P.add_argument("--salt", required=True)
-P.add_argument("--gap-s", type=float, default=0.0, help="pause between the last A turn and the first B turn")
+P.add_argument("--gap-s", type=float, default=0.0, help="next-turn arrival at the controller = (A last response complete) + gap; same in every arm")
 P.add_argument("--hook", default="", help="shell command run during the gap (e.g. trigger the export/import)")
 P.add_argument("--post-hook", default="", help="shell command run after the B turns (e.g. release A's pin); rc!=0 -> cell invalid")
 P.add_argument("--out", default="/tmp/gc_cell.jsonl")
@@ -50,21 +50,44 @@ def call(url, turn, ep):
 rows = []
 for t in range(args.turns_a):
     r = call(args.url_a, t, "A"); rows.append(r); print(json.dumps(r), flush=True)
+# Gap protocol (review 2026-09-06): t0 = A's last response complete. The hook (export ->
+# import -> cleanup) starts in the background at t0. The next turn "arrives" at the
+# controller at t0 + gap in every arm. WAIT policy: an arm with a hook dispatches to B
+# only after the hook finished successfully (cleanup included); B0 dispatches at arrival.
+# Primary metric = arrival -> response complete (waiting is part of the cost).
+t0 = time.time()
+hook_proc = None
 if args.hook:
     import subprocess
-    t0 = time.time(); rc = subprocess.call(args.hook, shell=True)
-    print(json.dumps({"hook": args.hook, "rc": rc, "seconds": round(time.time()-t0, 3)}), flush=True)
-    if rc != 0:
+    hook_proc = subprocess.Popen(args.hook, shell=True)
+arrival = t0 + args.gap_s
+if time.time() < arrival:
+    time.sleep(arrival - time.time())
+arrival_ts = time.time()
+hook_rc, hook_wall = None, None
+if hook_proc is not None:
+    hook_rc = hook_proc.wait()
+    hook_wall = round(time.time() - t0, 3)
+    print(json.dumps({"hook": args.hook, "rc": hook_rc, "seconds": hook_wall, "started_at": "t0"}), flush=True)
+    if hook_rc != 0:
         # spec §9: a failed migration hook fails the cell; never run B on an unverified import
         with open(args.out, "w") as f:
             for r in rows: f.write(json.dumps(r) + "\n")
-            f.write(json.dumps({"cell_invalid": True, "reason": f"hook rc={rc}"}) + "\n")
-        print(f"\n=== CELL_INVALID: hook failed rc={rc}; B turns skipped | out={args.out}")
+            f.write(json.dumps({"cell_invalid": True, "reason": f"hook rc={hook_rc}"}) + "\n")
+        print(f"\n=== CELL_INVALID: hook failed rc={hook_rc}; B turns skipped | out={args.out}")
         raise SystemExit(1)
-if args.gap_s > 0:
-    time.sleep(args.gap_s)
-for t in range(args.turns_a, args.turns_a + args.turns_b):
-    r = call(args.url_b, t, "B"); rows.append(r); print(json.dumps(r), flush=True)
+dispatch_ts = time.time()
+timeline = {"timeline": True, "gap_s": args.gap_s, "t0": round(t0, 3), "arrival_after_t0_s": round(arrival_ts - t0, 3),
+            "hook_wall_s": hook_wall, "wait_s": round(dispatch_ts - arrival_ts, 3), "dispatch_after_t0_s": round(dispatch_ts - t0, 3)}
+for i, t in enumerate(range(args.turns_a, args.turns_a + args.turns_b)):
+    r = call(args.url_b, t, "B")
+    if i == 0:
+        r["gap_s"] = args.gap_s; r["wait_s"] = timeline["wait_s"]
+        r["arrival_to_done_s"] = round(time.time() - arrival_ts, 3)
+        timeline["first_b_arrival_to_done_s"] = r["arrival_to_done_s"]; timeline["first_b_http_latency_s"] = r["latency_s"]
+    rows.append(r); print(json.dumps(r), flush=True)
+print(json.dumps(timeline), flush=True)
+rows.append(timeline)
 
 with open(args.out, "w") as f:
     for r in rows:
@@ -79,9 +102,10 @@ if args.post_hook:
             f.write(json.dumps({"cell_invalid": True, "reason": f"post_hook rc={rc}"}) + "\n")
         print(f"\n=== CELL_INVALID: post-hook failed rc={rc} | out={args.out}")
         raise SystemExit(1)
-ok = sum(r["ok"] for r in rows)
-bad = [r for r in rows if not r["ok"] or not r.get("marker_ok")]
-print(f"\n=== {ok}/{len(rows)} ok, {len(bad)} bad (http error or marker mismatch) | A turns {args.turns_a} -> B turns {args.turns_b} | out={args.out}")
+turns = [r for r in rows if "turn" in r]
+ok = sum(r["ok"] for r in turns)
+bad = [r for r in turns if not r["ok"] or not r.get("marker_ok")]
+print(f"\n=== {ok}/{len(turns)} ok, {len(bad)} bad (http error or marker mismatch) | A turns {args.turns_a} -> B turns {args.turns_b} | gap {args.gap_s}s | out={args.out}")
 if bad:
     with open(args.out, "a") as f:
         f.write(json.dumps({"cell_invalid": True, "reason": f"{len(bad)} request(s) failed or wrong marker"}) + "\n")

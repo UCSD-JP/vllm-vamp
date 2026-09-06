@@ -70,6 +70,16 @@ def cleanup_and_verify(args, import_done=True):
     release drains, then verify both sides. Returns (ok, cleanup_s)."""
     t0 = time.time()
     b = rpc(args.b_agent, {"cmd": "cleanup", "scope": "import"}); step("B_cleanup", **b)
+    if not b.get("ok"):
+        # review 2026-09-06: the destination may still be reading the shared payload; never
+        # release A's lock/key/payload under it. Preserve A and fail the gate (operator
+        # recovery: drain B, then --cleanup-only).
+        sa = rpc(args.a_agent, {"cmd": "status"}); sb = rpc(args.b_agent, {"cmd": "status"})
+        cleanup_s = round(time.time() - t0, 3)
+        step("CLEANUP_GATE", ok=False, cleanup_s=cleanup_s, failed_checks=["B_cleanup_ok"],
+             note="A cleanup skipped, A resources preserved", A_cxl_export_held=sa.get("cxl_export_held"),
+             A_leases=sa.get("active_leases"), B_import_stage=sb.get("import_stage"), B_cxl_import_stage=sb.get("cxl_import_stage"))
+        return False, cleanup_s
     a = rpc(args.a_agent, {"cmd": "cleanup", "scope": "export", "confirmed": import_done}); step("A_cleanup", **a)
     step("A_nudge_release", latency_s=nudge(args.a_url, args.model, "release"))
     sa = rpc(args.a_agent, {"cmd": "status"}); sb = rpc(args.b_agent, {"cmd": "status"})

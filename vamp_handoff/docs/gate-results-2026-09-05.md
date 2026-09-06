@@ -399,6 +399,21 @@ A 쪽은 세 arm 모두 turn 0 = 4.21–4.26 s(cold), turn 1–2 = 0.53–0.54 s
 
 **이전 "직접 이동이 gap=0에서 재계산보다 느리다"(D3 follow-up 9.670 s)는 전적으로 SHA-256 host readback 검증(10.7 s)이었다.** DMA는 0.31+0.21 s뿐. GPU 내 블록별 64-bit 합(gpu64)은 0.01 s로 none과 동일 시간이며 블록 오배치·대량 손상은 잡는다(비암호학적; SHA-256=correctness 기준선). **gpu64로 직접 이동은 gap=0에서 재계산의 약 절반**(2.28 vs 4.71 s), B HTTP 0.56 vs 4.57 s. n=1, 정책 우위 아님.
 
+## Near-complete replay rp1 — arm S vs L (2026-09-06, `replay-rp1-results-2026-09-06.md`)
+
+48세션 전 턴 2,211턴·55.2M tok, closed loop, 토큰 예산 admission(0.8×pool), arm마다 cold reset, 이동 없음. **stall 없이 양 arm 완주.**
+
+| | S(정적 owner) | L(부하 초과 시 상대 worker에서 재계산) |
+| --- | ---: | ---: |
+| 전체 시간 | **4,872 s** (11,336 tok/s) | 7,666 s (7,205 tok/s, −36%) |
+| HTTP 지연 p50/p90/p99 | 2.35 / 26.4 / 36.9 s | 19.2 / 32.4 / 40.2 s |
+| TTFT p50 | 1.16 s | 13.2 s |
+| 이동 턴 / 연속 턴 worker 변경 | 0 / 0 | 917 / 892 |
+| 토큰 GPU-hit / CPU-restored / **재계산** | 6.6 / 65.4 / **28.0 %** | 3.3 / 33.8 / **62.9 %** |
+| CPU tier eviction 블록 | 0.91M | 2.12M |
+
+**읽는 법**: 부하만 보고 옮기면 locality가 파괴된다(892회 bounce마다 10–60K prefix 재계산, DRAM tier 중복으로 eviction 2.3배, 재계산 비율 28→63%, 전체 시간 +57%). 균형 이득은 거의 없음(29.1/26.1M vs 28.9/26.3M). = "load가 지는 regime"의 전체 replay 실측 → 결정층은 reuse 위치와 이동/재계산 비용을 함께 봐야 함(V-* valuation arm 동기). n=1/arm, admission wait는 closed-loop 아티팩트로 별도.
+
 ## 다른 gate
 
 **2026-09-06 D3 follow-up (Codex)**: actual GPU KV -> registered shared CXL ->
@@ -412,6 +427,7 @@ statements above describe the earlier gates, not the current status.
 
 | Gate | 상태 | 비고 |
 | --- | --- | --- |
+| replay rp1 S/L | **완료(n=1/arm, 2,211턴)** | S 4,872 s vs L 7,666 s; L은 재계산 63%·bounce 892회 → load-only 재배치가 locality 파괴. 위 참조 |
 | D3 검증 분리 | **완료(n=1)** | SHA-256 host readback가 직접 경로 break-even의 원인; gpu64로 gap=0서 재계산의 절반(2.28 vs 4.71 s). 위 참조 |
 | D0–D2 직접 경로 | **PASS** | 등록 ok(flag 0), 2 GiB GPU→CXL 7.3 GB/s / CXL→GPU 10.7 GB/s, cross-host 바이트 일치. D3(실 KV) 미완 |
 | Gap `gap1` | **완료(n=1, 12셀)** | 도착→완료: B0 4.2–4.3 s 상수; B2 8.58/3.19/0.65/0.66; B1 27.84/22.70/17.98/0.64 (gap 0/5/10/35). 위 참조 |

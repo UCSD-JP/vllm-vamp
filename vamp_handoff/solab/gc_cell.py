@@ -53,6 +53,13 @@ if args.hook:
     import subprocess
     t0 = time.time(); rc = subprocess.call(args.hook, shell=True)
     print(json.dumps({"hook": args.hook, "rc": rc, "seconds": round(time.time()-t0, 3)}), flush=True)
+    if rc != 0:
+        # spec §9: a failed migration hook fails the cell; never run B on an unverified import
+        with open(args.out, "w") as f:
+            for r in rows: f.write(json.dumps(r) + "\n")
+            f.write(json.dumps({"cell_invalid": True, "reason": f"hook rc={rc}"}) + "\n")
+        print(f"\n=== CELL_INVALID: hook failed rc={rc}; B turns skipped | out={args.out}")
+        raise SystemExit(1)
 if args.gap_s > 0:
     time.sleep(args.gap_s)
 for t in range(args.turns_a, args.turns_a + args.turns_b):

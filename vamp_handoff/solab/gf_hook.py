@@ -34,12 +34,17 @@ T0 = time.time()
 def step(name, **kw):
     kw["step"] = name; kw["t"] = round(time.time() - T0, 3); print(json.dumps(kw), flush=True)
 
+STAGES = ["idle", "reserve_posted", "reserved", "commit_posted", "committed"]
+
 def wait_stage(target, budget):
+    # one status call may advance several stages (reserved -> refresh/sha256/copy ->
+    # commit_posted), so accept any stage at or beyond the target
     t0 = time.time()
     while time.time() - t0 < budget:
         st = rpc(args.b_agent, {"cmd": "cxl_import_status"})
-        if st.get("stage") == target: return st
-        if st.get("stage") == "failed": step("B_cxl_import_failed", **st); sys.exit(3)
+        stage = st.get("stage")
+        if stage == "failed": step("B_cxl_import_failed", **st); sys.exit(3)
+        if stage in STAGES and STAGES.index(stage) >= STAGES.index(target): return st
         time.sleep(0.2)
     step("timeout_waiting", target=target); sys.exit(4)
 

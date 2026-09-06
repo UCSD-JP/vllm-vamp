@@ -50,6 +50,13 @@
 | 준비/정리 시간 분리 | hook JSON `transfer_s` / `cleanup_s` | b1_gate 29.9 / 0.22 s |
 | ③ 묶음 전 fresh start 1회 | 양 worker 정지 → `cxl_fresh_start.sh` → nid 0·lock thread 확인 → arms | 실행 중 |
 
+## 3c. 2차 리뷰(5ea4b2234) 반영 + gap1 결과 — `195e9c2e0`
+
+- `hook_common.cleanup_and_verify`: B cleanup `ok=false`면 A cleanup 호출 없이 gate 실패(A lock/key/payload 보존, `note: A cleanup skipped`). 이전 성공 셀은 모두 B ok였으므로 무효 아님.
+- gap 프로토콜(gc_cell): hook 백그라운드 시작(t0), 도착 = t0+gap, WAIT(hook+cleanup 성공 후 전송), 첫 B 턴 `wait_s`/`arrival_to_done_s` + `timeline` 행. `compare_arms.sh`: `RUN`/`GAPS`, 기존 파일 있으면 중단.
+- 결과 12셀(gate-results "Gap 실험 `gap1`"): 도착→완료 B0 4.2–4.3 상수; B2 8.58/3.19/0.65/0.66; B1 27.84/22.70/17.98/0.64 (gap 0/5/10/35). crossover 관측 ≈ CXL 3.9–4.0 s, TCP 23.5 s.
+- 알려진 계측 아티팩트: runner `hook_wall_s`는 도착 후 측정 → `max(hook, gap)`; hook 실제 소요는 hook `total_s`. 다음 반복 측정 전에 runner가 hook 종료 시각을 폴링으로 직접 기록하도록 고칠 예정.
+
 ## 4. 부수 사항
 
 - 표현 정정 반영: agent 주석 "zero-copy view" → "CXL 매핑 view, `import_payload`가 CPU tier로 복사".

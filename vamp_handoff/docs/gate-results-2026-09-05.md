@@ -351,10 +351,28 @@ A 쪽은 세 arm 모두 turn 0 = 4.21–4.26 s(cold), turn 1–2 = 0.53–0.54 s
 
 **읽는 법(주장 아님, 관측 응답 지연)**: 목적지 B의 첫 턴은 local-cold 재계산(B0) 4.28 s 대비 CPU tier restore(B1·B2) 0.64 s로, **B1과 B2는 B 첫 턴에서 구별되지 않는다**(둘 다 CPU tier에 같은 블록이 있음). 차이는 **gap 안의 준비 비용**: 네트워크 26.0 s vs CXL 7.0 s(같은 2.10 GB, 같은 gather·sha256 포함; TCP prototype은 8 MiB chunk 단일 스트림이라 최적화된 네트워크 경로의 대표치가 아님). 이 준비 비용이 B 첫 요청 도착 전에 끝나야 이득이 실현되므로 gap 길이가 정책 변수 — gap 비교(도착 전/후)는 다음 단계. n=1, 통제된 성능 비교가 아니라 경로 기능·비용 자릿수 확인.
 
+## Gap 실험 `gap1` — 3 arm × 4 gap, WAIT 정책 (2026-09-06 07:21–07:46Z)
+
+프로토콜(Codex 명세): `t0` = A 마지막 응답 완료. hook(export→import→cleanup)은 t0에 백그라운드 시작. 다음 턴의 controller **도착 = t0 + gap(전 arm 동일)**. B0는 도착 즉시 B로 전송(local-cold 재계산), B1/B2는 hook이 **cleanup까지 성공 완료**한 뒤 전송(WAIT; 재계산 병행 없음). **주 지표 = 도착→응답 완료**(기다린 비용 포함). 셀마다 cold reset, 동일 prompt 12,821 tok, `RUN=gap1` 파일명 분리. 12/12 CELL_OK, 12/12 strict gate ok, 5/5 marker ×12.
+
+| gap | B0 도착→완료 | B1(network) hook / wait / **도착→완료** | B2(CXL) hook / wait / **도착→완료** |
+| --- | --- | --- | --- |
+| 0 s | **4.214** | 27.10 / 27.19 / **27.838** | 7.86 / 7.94 / **8.582** |
+| 5 s | **4.297** | 26.98 / 22.06 / **22.701** | 7.46 / 2.55 / **3.189** |
+| 10 s | **4.308** | 27.26 / 17.34 / **17.975** | 7.58 / 0 / **0.646** |
+| 35 s | **4.286** | 27.05 / 0 / **0.642** | 7.92 / 0 / **0.663** |
+
+(hook = hook 자체 `total_s`, cleanup 0.11–0.20 s 포함. runner의 `hook_wall_s`는 도착 후 측정돼 `max(hook, gap)`이 되므로 쓰지 않음. A turn 0 cold 4.22–4.27 s 12셀 동일, B turn 4 GPU hit 0.53–0.55 s 12셀 동일, B 첫 턴 HTTP 지연은 B1·B2 모두 0.64–0.66 s.)
+
+**읽는 법(n=1, 관측값)**: 이득 조건 `남은 준비 대기 + restore < 재계산`. B2(CXL)는 gap 5 s에서 이미 재계산보다 짧고(3.19 < 4.30), gap 0에서는 길다(8.58 > 4.21) → crossover는 gap ≈ hook − (재계산 − restore) ≈ 7.6 − 3.65 ≈ **3.9–4.0 s**(Codex 사전 예상 3.6 s는 hook 7.0 s 기준). B1(TCP prototype)은 gap 10 s에서도 재계산의 4배(17.98) → crossover ≈ 27.1 − 3.65 ≈ **23.5 s**(예상 22.7 s), gap 35 s에서 완료. gap ≥ hook이면 두 경로는 구별되지 않는다(0.64 vs 0.66). **주장 아님**: 정책 우위나 일반적 CXL-대-네트워크 성능 주장이 아니라 경로 비용 자릿수와 WAIT 정책의 손익 경계 1점 관측. TCP prototype은 8 MiB chunk 단일 스트림. 다음 = 반복 측정(≥3), 이후 "늦은 import와 재계산 병행" 정책.
+
+**정리 순서 수정(Codex, `195e9c2e0`)**: `hook_common.cleanup_and_verify`가 B cleanup 거절 시 A cleanup을 호출하지 않고(A lock/key/payload 보존) gate 실패로 종료. 이번 12셀·이전 성공 셀은 모두 B cleanup ok였으므로 결과 무효 아님.
+
 ## 다른 gate
 
 | Gate | 상태 | 비고 |
 | --- | --- | --- |
+| Gap `gap1` | **완료(n=1, 12셀)** | 도착→완료: B0 4.2–4.3 s 상수; B2 8.58/3.19/0.65/0.66; B1 27.84/22.70/17.98/0.64 (gap 0/5/10/35). 위 참조 |
 | B0/B1/B2 | **완료(n=1)** | 동일 입력·cold reset·strict gate. B 첫 턴 4.28 / 0.64 / 0.65 s, 준비 비용 – / 26.0 / 7.0 s. 위 참조 |
 | 실패 주입·정리 | **PASS** | wrong_key / checksum 둘 다 `CLEANUP_GATE ok`, 실패 전파 확인. 위 참조 |
 | G-B | **headroom 계측 진단 완료 / 고정 배치 미검증** | 통과 조건(카운터 해석·무오류) 충족, "worker당 4 고정" 전제 미충족. 1차 INVALID(cache 오염) → 2차 유효 |

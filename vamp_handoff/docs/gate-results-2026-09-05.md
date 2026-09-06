@@ -337,10 +337,25 @@ A sidecar: connector 0/13,882(turn 0 cold), GPU 66.5%. 5/5 marker 정답.
 
 **사고 1건(원인 확정·수정)**: 첫 `fail_wrongkey`에서 A cleanup이 다른 RPC 스레드에서 실행되어 provider `my_id`(TLS)가 -1 → lock timeout 480 s → **EngineCore abort**. 격리 재현 후 agent의 모든 provider 호출을 전용 스레드 1개로 직렬화(`bf589151e`, `provider-api-findings` §4). 첫 `fail_checksum`은 hook이 상태 한 번에 reserved→failed 진행을 try 밖에서 관측해 정리 없이 종료 → 수정(`dd347096f`) 후 재실행. 이슈·질문 정리 = `review-request-2026-09-06-cleanup-gate.md`.
 
+## B0/B1/B2 통제 비교 — 1 세션, 동일 입력 (2026-09-06, `compare_arms.sh cmp`)
+
+설계(Codex 승인): 동일 `--salt cmp`(모든 arm에서 prompt_tokens **12,821** 동일), A 3턴 → gap(hook) → B 2턴, **arm마다 cold reset**(`arm_reset.sh`: worker+EngineCore 재기동, agent+bridge·etcd 1/1·양 endpoint 실요청 확인; manager·etcd·nats·frontend 유지), 묶음 시작 전 **fresh start 1회**(양 worker 정지 → `cxl_clear_ucsd` 32 s → manager nid 0 재기동, `fresh_start_20260906T070438Z.log`), 양 endpoint 동일 warm-up. 바뀐 것은 전송 메커니즘과 CXL key만. B0의 A auto-pin은 B 턴 후 post-hook(`gf_hook --cleanup-only`)으로 반납.
+
+| arm | gap 내용 | transfer_s / cleanup_s | **B 첫 턴(turn 3)** | B turn 4 | B turn 3 sidecar | gate |
+| --- | --- | --- | --- | --- | --- | --- |
+| **B0** recompute | 없음(gap 0) | – / 0.116 (post-hook) | **4.278 s** | 0.544 s | GPU hit 0, connector hit 0 / 12,821 (local-cold) | ok |
+| **B1** network KV | gd_hook: gather 1.82 s + TCP send 20.8 s(2,099,773,440 B) + commit | 26.014 / 0.202 | **0.638 s** | 0.549 s | connector hit **12,800 / 12,821**, GPU hit 0 | ok |
+| **B2** CXL KV | gf_hook: gather 1.49 s, CXL write 0.234 s, fence 0.155 s, sha256; B refresh 0.158 s, sha256 2.114 s, CXL→CPU 복사 0.692 s | 7.018 / 0.119 | **0.645 s** | 0.534 s | connector hit **12,800 / 12,821**, GPU hit 0 | ok |
+
+A 쪽은 세 arm 모두 turn 0 = 4.21–4.26 s(cold), turn 1–2 = 0.53–0.54 s(GPU hit) — cold reset이 arm 간 동일 시작 상태를 만들었다는 대조. B turn 4는 세 arm 모두 GPU hit 12,800(turn 3에서 채워진 GPU prefix) 0.53–0.55 s. 5/5 marker 정답 ×3, 세 arm 모두 strict `CLEANUP_GATE` ok, `ALL_ARMS_OK`.
+
+**읽는 법(주장 아님, 관측 응답 지연)**: 목적지 B의 첫 턴은 local-cold 재계산(B0) 4.28 s 대비 CPU tier restore(B1·B2) 0.64 s로, **B1과 B2는 B 첫 턴에서 구별되지 않는다**(둘 다 CPU tier에 같은 블록이 있음). 차이는 **gap 안의 준비 비용**: 네트워크 26.0 s vs CXL 7.0 s(같은 2.10 GB, 같은 gather·sha256 포함; TCP prototype은 8 MiB chunk 단일 스트림이라 최적화된 네트워크 경로의 대표치가 아님). 이 준비 비용이 B 첫 요청 도착 전에 끝나야 이득이 실현되므로 gap 길이가 정책 변수 — gap 비교(도착 전/후)는 다음 단계. n=1, 통제된 성능 비교가 아니라 경로 기능·비용 자릿수 확인.
+
 ## 다른 gate
 
 | Gate | 상태 | 비고 |
 | --- | --- | --- |
+| B0/B1/B2 | **완료(n=1)** | 동일 입력·cold reset·strict gate. B 첫 턴 4.28 / 0.64 / 0.65 s, 준비 비용 – / 26.0 / 7.0 s. 위 참조 |
 | 실패 주입·정리 | **PASS** | wrong_key / checksum 둘 다 `CLEANUP_GATE ok`, 실패 전파 확인. 위 참조 |
 | G-B | **headroom 계측 진단 완료 / 고정 배치 미검증** | 통과 조건(카운터 해석·무오류) 충족, "worker당 4 고정" 전제 미충족. 1차 INVALID(cache 오염) → 2차 유효 |
 | G-C | **PASS** | 고정 endpoint(네임스페이스 분리)로 목적지 보장. 위 참조 |

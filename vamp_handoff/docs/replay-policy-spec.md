@@ -1,5 +1,14 @@
 # Near-complete replay with a routing/migration decision layer
 
+**Status (2026-09-06, later the same day):** the token-budget admission and the
+S / L baselines below are implemented in `solab/replay_policy.py` and were run
+near-complete (rp1: S done, L running). The migration arm **M sketched here is
+superseded** by the valuation-based arms (RR / S / L / V-local / V-TCP / V-CXL) in
+[routing-valuation-spec.md](routing-valuation-spec.md) and their implementation
+(`policy_router.py`, `policy_replay.py`, `policy_agent.py`, `policy_suite.py`),
+which choose both destination and action with a cost model and run after rp1
+releases the GPUs. Do not implement M separately; use rp1 S/L as the baselines.
+
 ## Goal
 
 Run (near-)all recorded turns of the Heavy-48 SWE-agent trace over the two-node

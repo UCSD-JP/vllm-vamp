@@ -21,8 +21,8 @@
 
 - 매핑 결과가 `dax_base`(export 전역). **`dax_base` = 장치 오프셋 64 GiB = UCSD 슬라이스 시작.**
 - `cxl_shm_get_offset(ptr) = ptr − dax_base` (assert 문자열 `off_is_valid(((shm_ptr_t)((uintptr_t)(addr) - (uintptr_t)dax_base)))`로도 확인), `cxl_shm_get_ptr(off) = dax_base + off` (`off_is_valid` 검사 후).
-- 따라서 **API에 넘기는/받는 offset은 슬라이스 기준이며 우리 첫 주소는 `0`이다.** device offset = 64 GiB + off.
-- `off_is_valid(off)`는 `off ≤ 0x1fffffffff`(128 GiB) — 매핑 길이 기준이라 우리 유효 범위(64 GiB)보다 느슨하다. 64 GiB 이상 offset은 하위 tenant(장치 0–64 GiB)가 아니라 **장치 끝 너머**를 가리켜 접근 시 SIGBUS다(devdax는 mmap 시점이 아니라 fault 시점에 범위를 검사). 우리 `OffsetMapper`는 `slice_len_bytes=64 GiB, provider_maps_slice_relative=True`로 **더 엄격하게** 검사한다 → 하위 tenant 침범은 구조적으로 불가.
+- 따라서 **API가 다루는 offset은 슬라이스 기준**(`get_offset` 결과 0 = 장치 64 GiB)이며 device offset = 64 GiB + off. **단, 우리는 offset을 직접 만들어 쓰지 않는다**: `cxl_shm_put(key, addr)`의 `addr`는 `shmalloc`/`shm_payload_alloc`이 돌려준 로컬 포인터여야 하고, 슬라이스 앞부분은 라이브러리의 allocator·lock·key-value 메타데이터가 쓰고 있으므로 임의 offset 쓰기는 실행 중인 라이브러리를 깨뜨린다. 우리 adapter는 **allocator가 반환한 객체 범위 안에서만** 읽고 쓴다.
+- `off_is_valid(off)`는 `off ≤ 0x1fffffffff`(128 GiB) — 매핑 길이 기준이라 우리 유효 범위(64 GiB)보다 느슨하다. 라이브러리 검사에 의존하지 않고 우리 adapter가 **(offset, offset+len)이 64 GiB 안이고 allocator가 반환한 객체 범위 안인지**를 검사한다(`OffsetMapper(slice_len_bytes=64 GiB, provider_maps_slice_relative=True)` + 객체 경계 검사). SIGBUS 여부는 안전 근거로 삼지 않는다. payload 용량도 64 GiB가 아니라 **allocator의 사용 가능 범위**(manager가 출력하는 arena payload 범위)로 잡는다.
 - 라이브러리 안에 다른 64 GiB 상수(0x1000000000)는 이 mmap 한 곳뿐이다.
 
 ## 2. 초기화 범위 — node 0·rank 0만 arena를 재생성한다
@@ -54,7 +54,7 @@ void clflush_region_with_mfence(volatile void *addr, size_t size);
 void clflush_region_with_sfence(void *addr, size_t size);
 void clwb_region_with_barrier(void *addr, size_t size);
 ```
-세 함수 모두 `libcxl_shm_ucsd_N*.so`에 export(`nm -D`). 예제(`my_test/main.c`)는 `clflush_region_with_mfence(ptr, size)`를 쓴다.
+세 함수 모두 `libcxl_shm_ucsd_N*.so`에 export(`nm -D`). 예제(`my_test/main.c`)는 `clflush_region_with_mfence(ptr, size)`를 쓴다. **함수·호출 규약 확인과 cross-host 가시성 검증은 별개다** — 실제 lock+flush를 써서 s2 write → s1 read → checksum 일치를 확인해야 한다(`solab/cxl_ping.c`).
 우리 `CxlCopyTransport`에 주입할 callable:
 - **fence (write 후, COMPLETED 전)**: `clwb_region_with_barrier(dest, n)` 또는 `clflush_region_with_sfence(dest, n)` — 쓴 라인을 CXL로 내림.
 - **refresh (read 전)**: `clflush_region_with_mfence(src, n)` — 로컬 stale 라인을 무효화해 다음 read가 CXL에서 가져오게 함.
@@ -95,8 +95,8 @@ void cxl_shm_lock_release(cxl_lock_t lock);     // by value
 
 ## 8. 운영 절차(확정)
 
-- manager: s2에서만, 한 번만: `cd ~/work/bin && LD_LIBRARY_PATH=$HOME/work/lib ./start_server.sh` (출력을 파일로 남길 것 — arena 레이아웃 기록). **실험 중 재기동 금지**(= 슬라이스 재초기화).
-- 완전 초기화가 필요할 때만 `LD_LIBRARY_PATH=$HOME/work/lib ~/work/bin/cxl_clear_ucsd` (64 GiB memset, 수 분).
+- manager: **새 CXL 실험 묶음을 시작할 때 한 번**, s2에서만 (`solab/cxl_manager_start.sh`): ① 기존 manager/CXL 사용자 프로세스가 없는지 확인(있고 정상이면 재실행 금지) ② `PATH=$HOME/work/bin:$PATH LD_LIBRARY_PATH=$HOME/work/lib ./start_server.sh`(스크립트가 `start_cxl_manager`를 bare 이름으로 호출하므로 PATH 필요) ③ 로그 보존 ④ 고정 대기가 아니라 로그의 `initialized. id:[..]`·`empty arena:`·`DONE and Waiting forever`로 완료 판정 ⑤ s1은 `connect()`로 붙여 node ID와 작은 payload 공유를 확인. 이후 manager 유지. **실험 중 재기동 금지**(= 슬라이스 재초기화).
+- `cxl_clear_ucsd`(64 GiB memset)는 일반 시작 절차에 넣지 않는다 — 명시적 전체 초기화가 필요할 때만.
 - 우리 프로세스: `LD_LIBRARY_PATH=$HOME/work/lib`, `cxl_shm_connect()`(s2 추가 프로세스, s1), `my_nid()` 확인, 모든 offset은 slice-relative, 64 GiB 상한을 우리가 검사.
 
 ## 9. fixed-shared-memory-api.md / capability-audit 갱신 요약

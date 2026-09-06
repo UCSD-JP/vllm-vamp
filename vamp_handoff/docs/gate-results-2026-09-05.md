@@ -255,6 +255,31 @@ CPU→CXL, CXL→GPU: **없음**(G-E/F BLOCKED).
 
 **판정: 실제 경로별 측정값 확보(recompute / GPU hit / CPU restore 3크기, network 1점)** — frozen config 반영은 `configs/calibration_solab_2026-09-06.json`(라벨 `real`), no-oracle mock 통과는 정책 비교 단계에서.
 
+## G-E: CXL 작은 payload cross-host 안전 검증 (2026-09-06) — **PASS**
+
+전제 확정(`docs/provider-api-findings-2026-09-06.md`): offset은 slice-relative(dax_base = 장치 64 GiB), 우리는 allocator가 준 객체만 사용, fence/refresh는 export 함수, lock 핸들 8 B.
+
+### 기동 절차(실측으로 수정됨)
+1. **노드 ID는 라이브러리 변형에 컴파일**되어 있다: N0/N1의 유일한 코드 차이 = `__init_local`의 `movw $0x0|$0x1 → my_id.nid`. provider의 `libcxl_shm.so` symlink는 **양 노드 모두 N1** → s2에서 그대로 띄우면 manager가 nid 1로 attach(첫 시도: `id:[1,0,…]`, "empty arena" 없음, lock thread 없음). provider 파일은 그대로 두고 `~/vamp/cxl/lib/libcxl_shm.so`(s2→N0, s1→N1)를 `LD_LIBRARY_PATH` 앞에 둔다(`solab/cxl_manager_start.sh`).
+2. arena가 다른 node 0에 의해 초기화된 채 남아 있었으므로 예외 절차 `solab/cxl_fresh_start.sh`: 우리 manager 종료 → `cxl_clear_ucsd`(**offset 68,719,476,736 / size 68,719,476,736 출력 확인 = [64,128) GiB, 35 s**) → wrapper로 `start_server.sh`.
+3. 결과 `id:[0, 0, 221454]`, `initializing... clflush`, `Heap: init done`, `meta arena [34304,262144) payload arena [262144,33554432) pages`, `hash initialized 2097152`, lock thread(`lock_manager_thread_func`, rank 1) → **threads 2**, `DONE and Waiting forever`(pause 상주). 완료 판정은 로그 라인으로(고정 대기 아님).
+4. **arena 주의**: 페이지 단위 payload arena [1 GiB, 128 GiB) — allocator가 128 GiB 매핑 전체를 arena로 본다. 물리 슬라이스는 64 GiB이므로 **adapter가 모든 payload 할당의 offset+len < 64 GiB를 검사·거부**해야 하며 실사용 용량은 ≈63 GiB(1 GiB–64 GiB). `StoreCapacity`는 이 값으로 잡는다.
+
+### ping 결과 (`solab/cxl_ping.c`, provider 헤더·라이브러리로 빌드, writer s2 nid 0 / reader s1 nid 1)
+writer: `shmalloc` 레코드 + `shm_payload_alloc` payload + `cxl_shm_allocate_lock`; 패턴 채움 → `clwb_region_with_barrier`(fence) → lock → 레코드{magic, gen, nbytes, checksum, lockptr, payload_off, state=READY} → `clflush_region_with_mfence`(레코드) → unlock → `cxl_shm_put`.
+reader: `cxl_shm_connect` → `cxl_shm_get` → 레코드 refresh → `cxl_lock_t{lockptr}` 재구성 → lock → refresh → 레코드 읽기 → unlock → payload refresh(`clflush_region_with_mfence`) → checksum.
+
+| nbytes | payload off | fence(clwb) | connect(s1) | lock wait | refresh(clflush) | checksum |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 MiB | 0x40000000 (1 GiB) | 0.1 ms | 0.092 s(첫 attach) | 0.0 ms | 0.1 ms | **일치** |
+| 64 MiB | 0x40100000 | 4.9 ms | 0.000 s | 0.0 ms | 7.2 ms | **일치** |
+| 1 GiB | 0x44100000 | 79 ms | 0.000 s | 0.1 ms | 85 ms | **일치** |
+
+- 다른 노드가 만든 lock을 lockptr로 재구성해 acquire 성공 → `FOREIGN_ENTRY_LOCK_UNAVAILABLE` 해소 경로 실증.
+- 할당은 payload arena 시작(1 GiB)부터 상향 — 모두 64 GiB 안(검사 통과).
+- 통과 조건 대비: startup 절차 ✅, offset 경계 ✅(allocator 객체만, 64 GiB 검사), lock/visibility ✅(cross-host lock + fence/refresh 후 checksum 일치), generation ✅(레코드 gen 전달·확인; 다중 generation 교체 시나리오는 G-F에서).
+- 미측정: refresh 없이 읽었을 때 stale이 실제로 관측되는지(negative test) — G-F 전에 `--no-refresh` 변형으로 1회 확인 권장.
+
 ## 다른 gate
 
 | Gate | 상태 | 비고 |
@@ -262,7 +287,8 @@ CPU→CXL, CXL→GPU: **없음**(G-E/F BLOCKED).
 | G-B | **headroom 계측 진단 완료 / 고정 배치 미검증** | 통과 조건(카운터 해석·무오류) 충족, "worker당 4 고정" 전제 미충족. 1차 INVALID(cache 오염) → 2차 유효 |
 | G-C | **PASS** | 고정 endpoint(네임스페이스 분리)로 목적지 보장. 위 참조 |
 | G-D | **PASS** | in-engine agent + 제어 채널 + nudge로 export→TCP→import→restore end-to-end. 위 참조 |
-| G-E~G-F | NOT_RUN / **BLOCKED** | 실제 CXL 접근 — provider 확인(manager startup/clear protocol, offset origin, fence/refresh primitive, lock ABI) 전 실행 금지 |
+| G-E | **PASS** | node 0 manager 기동(N0 라이브러리), 1 MiB/64 MiB/1 GiB cross-host lock+fence/refresh+checksum 일치 |
+| G-F | NOT_RUN | 다음: ctypes 바인딩 + agent CXL export/import → 실제 KV 1세션 A→CXL→B |
 | G-G | **PARTIAL** | 요청 없는 gap 중 publication은 **network 목적지로 실증**(G-D hook이 양 엔진 idle 상태에서 수행); DRAM→CXL 변형은 G-E/F 승인 후 |
 | G-H | **측정 완료(부분)** | recompute/GPU hit/CPU restore ×3 크기 + network 1점. CXL 경로 없음 |
 

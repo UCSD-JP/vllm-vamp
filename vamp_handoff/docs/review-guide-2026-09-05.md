@@ -139,3 +139,9 @@ Codex 리뷰 문서(`full-review-42731a5.md`, `demo-feasibility-plan-2026-09-05.
 - cross-host BlockHash 일치: `PYTHONHASHSEED=0`로 충분함을 실측(B commit 시 READY hash head = A와 동일, B lookup이 A 키로 hit).
 - 남은 것: G-E/F(CXL, provider 확인 BLOCKED), G-G의 CXL 변형, G-H calibration, 정책 비교. idle 엔진의 mailbox drain을 위한 nudge는 임시 수단 — vLLM 측 idle tick이 없어 현재 스택에선 대안이 없음(문서화).
 - 리뷰 시 볼 것: agent가 worker-side tensor에 쓰는 시점(`import_written`)이 scheduler-side commit(`import_committed`) 이전이며 그 사이 해당 슬롯은 RESERVED(READY 아님) — `reserve_import`가 prepare_store로 슬롯을 잡아두므로 다른 store가 덮어쓰지 않음. 테스트 `test_solab_agent_pins_first_large_ready_run_only`(실제 manager, s1 8/8).
+
+## 9. CXL 경로 도달 상태 (2026-09-06)
+
+- provider API 확정(findings 문서) → node 0 manager 기동(N0 라이브러리, `cxl_manager_start.sh`/`cxl_fresh_start.sh`) → C ping → ctypes 바인딩·negative stale test → **G-F PASS**(`gf2`: 2.26 GB A→CXL→B, B restore 0.654 s).
+- 리뷰 시 볼 것: `vamp_agent._cxl_export`가 payload offset+len < 64 GiB를 검사하고 초과 시 free 후 거부하는지; `_cxl_import_advance`가 refresh 후 sha256 일치를 요구하고 불일치 시 `commit_import(False)`로 슬롯을 되돌리는지; 레코드 읽기가 entry lock 아래에서 refresh 후 이루어지는지; hook rc≠0 → cell invalid.
+- 남은 것: B0/B1(및 B2) 정책 arm을 runner↔agent로 배선, 실패·정리 gate(lease/payload 회수, cold restart), gap 비교, 8→32세션, dead-writer 회수(범위 밖).

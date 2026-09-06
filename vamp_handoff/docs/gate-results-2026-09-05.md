@@ -295,6 +295,33 @@ reader: `cxl_shm_connect` → `cxl_shm_get` → 레코드 refresh → `cxl_lock_
 
 바인딩 변경: `EntryRecord`에 `lockptr` 추가 → foreign 항목을 `_lookup`이 lock과 함께 채택(`FOREIGN_ENTRY_LOCK_UNAVAILABLE` 해소, 에뮬레이션 테스트 `test_foreign_ready_entry_is_readable_via_record_lockptr`), payload는 `shm_payload_alloc`(payload arena), `_read_entry`/`_write_entry`가 refresh/fence 수행, 64 GiB 경계는 `OffsetMapper.check_range`.
 
+## G-F: B2 한 세션 실제 CXL KV migration (2026-09-06) — **PASS** (`gf2`)
+
+토폴로지 G-C/G-D와 동일(vampA=s1:8080, vampB=s2:8081), 양 worker `vamp_agent`(CXL 경로 포함), `CXL_SHM_LIBRARY`=노드별 symlink(s2→N0, s1→N1), manager(node 0, pid 221454) 상주. `--salt gf2`, tier·candidate 초기화(재기동). 1 세션 turn 0–2 → A, **gap 중 `solab/gf_hook.py`** → turn 3–4 → B. prompt 13,822 tok = 864 blocks.
+
+hook(7.3 s): A `cxl_export` → B `cxl_import_prepare` → nudge → B `cxl_import_status`(refresh→sha256→CXL→CPU zero-copy→commit 포스트) → nudge → committed.
+
+| 단계 | 값 |
+| --- | --- |
+| A `cxl_export_done` | 864 blocks = **2,264,924,160 B**, payload_off 4,382,523,392(≈4.08 GiB, 64 GiB 안 — adapter 검사 통과), gather 1.50 s, **CXL write(memmove) 0.234 s (~9.7 GB/s), fence(clwb) 0.167 s**, sha256 1.57 s, 레코드 lockptr 0xC000008403000 |
+| B `cxl_import_reserved` | 864 to_store, 0 evicted (nudge #1로 drain) |
+| B `cxl_import_written` | **refresh(clflush) 0.170 s, sha256 2.545 s = A 값과 일치, CXL→CPU 0.804 s**(zero-copy view → `bridge.import_payload`) |
+| B `cxl_import_committed` | 864 blocks; READY 이벤트 hash head `bc620938…` = A와 동일 |
+
+| turn | endpoint | latency |
+| --- | --- | --- |
+| 0 | A | 4.535 s (cold) |
+| 1–2 | A | 0.540 / 0.538 s |
+| **3** | **B** | **0.654 s** — connector **13,792 / 13,883 (99.3%)** = CXL에서 가져온 CPU tier restore |
+| 4 | B | 0.543 s (GPU hit) |
+
+A sidecar: connector 0/13,882(turn 0 cold), GPU 66.5%. 5/5 marker 정답.
+
+**판정: PASS** — local-cold 목적지(B)에서 shared READY prefix가 복원되어 정답 출력. checksum(A sha256 = B sha256 after refresh) 일치, 레이아웃(864 × 2,621,440) 일치, generation 1 확인.
+**1차(`gf`)는 절차상 INVALID**: 기능은 동일하게 성공(B 0.68 s, connector 99.6%)했으나 hook이 중간 단계 "reserved"만 기다려 timeout(rc 4)했고 runner가 B 턴을 진행함. 수정(`bae291922`): hook은 target 이상 단계 허용, `gc_cell.py`는 hook rc≠0 시 `cell_invalid` 기록 후 중단. raw `gf_*` 보존.
+
+관측(주장 아님): 실제 데이터 이동은 write 0.23 + fence 0.17 + refresh 0.17 + read/copy 0.80 ≈ **1.4 s / 2.26 GB**(TCP prototype 21.7 s / 2.1 GB 대비), sha256 검증 2회(A 1.6 s + B 2.5 s)가 gap 비용의 대부분. nudge 2건은 여전히 필요(idle EngineCore). 이 값들도 응답 지연/벽시계이며 통제된 성능 비교가 아니다.
+
 ## 다른 gate
 
 | Gate | 상태 | 비고 |
@@ -303,8 +330,8 @@ reader: `cxl_shm_connect` → `cxl_shm_get` → 레코드 refresh → `cxl_lock_
 | G-C | **PASS** | 고정 endpoint(네임스페이스 분리)로 목적지 보장. 위 참조 |
 | G-D | **PASS** | in-engine agent + 제어 채널 + nudge로 export→TCP→import→restore end-to-end. 위 참조 |
 | G-E | **PASS** | node 0 manager 기동(N0 라이브러리), 1 MiB/64 MiB/1 GiB cross-host lock+fence/refresh+checksum 일치 |
-| G-F | NOT_RUN | 다음: ctypes 바인딩 + agent CXL export/import → 실제 KV 1세션 A→CXL→B |
-| G-G | **PARTIAL** | 요청 없는 gap 중 publication은 **network 목적지로 실증**(G-D hook이 양 엔진 idle 상태에서 수행); DRAM→CXL 변형은 G-E/F 승인 후 |
+| G-F | **PASS** | 1세션 A→CXL→B: 2.26 GB, B 첫 턴 0.654 s, connector 99.3%, sha256 일치 |
+| G-G | **gap 중 전송 가능성 확인** (network·CXL 변형 모두) | 양 엔진 idle 중 hook이 수행; 단 mailbox drain에 nudge 요청 2건 필요 → "요청 없이 완전 자율 실행"은 아님. 자율 publication(pin 시점 결정·타이머)은 정책 단계 |
 | G-H | **측정 완료(부분)** | recompute/GPU hit/CPU restore ×3 크기 + network 1점. CXL 경로 없음 |
 
 ## 부수 확인

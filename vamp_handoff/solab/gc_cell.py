@@ -37,14 +37,14 @@ def call(url, turn, ep):
     b = json.dumps({"model": args.model, "messages": [{"role": "user", "content": msg}],
                     "max_tokens": 24, "temperature": 0}).encode()
     req = urllib.request.Request(url, data=b, headers={"Content-Type": "application/json"})
-    t0 = time.time()
+    t0 = time.monotonic()
     try:
         d = json.load(urllib.request.urlopen(req, timeout=600))
         c = (d["choices"][0]["message"].get("content") or "").strip()
-        return {"session": sid, "turn": turn, "endpoint": ep, "latency_s": round(time.time()-t0, 3), "ok": True,
+        return {"session": sid, "turn": turn, "endpoint": ep, "latency_s": round(time.monotonic()-t0, 3), "ok": True,
                 "prompt_tokens": d.get("usage", {}).get("prompt_tokens"), "marker_ok": f"S{sid}T{turn}_OK" in c}
     except Exception as e:
-        return {"session": sid, "turn": turn, "endpoint": ep, "latency_s": round(time.time()-t0, 3), "ok": False,
+        return {"session": sid, "turn": turn, "endpoint": ep, "latency_s": round(time.monotonic()-t0, 3), "ok": False,
                 "error": f"{type(e).__name__}: {str(e)[:120]}"}
 
 rows = []
@@ -55,26 +55,32 @@ for t in range(args.turns_a):
 # controller at t0 + gap in every arm. WAIT policy: an arm with a hook dispatches to B
 # only after the hook finished successfully (cleanup included); B0 dispatches at arrival.
 # Primary metric = arrival -> response complete (waiting is part of the cost).
-t0 = time.time()
+# Clocks (review 2026-09-06): deadlines and elapsed times use the monotonic clock; the
+# metric is measured from the *scheduled* arrival t0+gap, not from the runner's wakeup
+# (the wakeup lag is recorded separately as wakeup_late_s). The hook end is observed by
+# polling, so hook_wall_s has HOOK_POLL_S granularity.
+HOOK_POLL_S = 0.01
+t0_wall = time.time(); t0 = time.monotonic()
 hook_proc = None
 if args.hook:
     import subprocess
     hook_proc = subprocess.Popen(args.hook, shell=True)
-arrival = t0 + args.gap_s
-hook_done_ts = None
-while time.time() < arrival:
-    # record the hook's own completion time even when it finishes before the arrival
-    if hook_proc is not None and hook_done_ts is None and hook_proc.poll() is not None:
-        hook_done_ts = time.time()
-    time.sleep(min(0.05, max(0.0, arrival - time.time())))
-arrival_ts = time.time()
+arrival = t0 + args.gap_s                     # scheduled arrival of the next turn (same in every arm)
+hook_done = None
+while time.monotonic() < arrival:
+    if hook_proc is not None and hook_done is None and hook_proc.poll() is not None:
+        hook_done = time.monotonic()
+    time.sleep(min(HOOK_POLL_S, max(0.0, arrival - time.monotonic())))
+wakeup = time.monotonic()
 hook_rc, hook_wall = None, None
 if hook_proc is not None:
-    hook_rc = hook_proc.wait()
-    if hook_done_ts is None:
-        hook_done_ts = time.time()
-    hook_wall = round(hook_done_ts - t0, 3)   # actual hook duration (not max(hook, gap))
-    print(json.dumps({"hook": args.hook, "rc": hook_rc, "seconds": hook_wall, "started_at": "t0"}), flush=True)
+    while hook_proc.poll() is None:            # WAIT policy: dispatch only after the hook succeeded
+        time.sleep(HOOK_POLL_S)
+    hook_rc = hook_proc.returncode
+    if hook_done is None:
+        hook_done = time.monotonic()
+    hook_wall = round(hook_done - t0, 3)       # observed with HOOK_POLL_S granularity
+    print(json.dumps({"hook": args.hook, "rc": hook_rc, "seconds": hook_wall, "started_at": "t0", "poll_s": HOOK_POLL_S}), flush=True)
     if hook_rc != 0:
         # spec §9: a failed migration hook fails the cell; never run B on an unverified import
         with open(args.out, "w") as f:
@@ -82,14 +88,16 @@ if hook_proc is not None:
             f.write(json.dumps({"cell_invalid": True, "reason": f"hook rc={hook_rc}"}) + "\n")
         print(f"\n=== CELL_INVALID: hook failed rc={hook_rc}; B turns skipped | out={args.out}")
         raise SystemExit(1)
-dispatch_ts = time.time()
-timeline = {"timeline": True, "gap_s": args.gap_s, "t0": round(t0, 3), "arrival_after_t0_s": round(arrival_ts - t0, 3),
-            "hook_wall_s": hook_wall, "wait_s": round(dispatch_ts - arrival_ts, 3), "dispatch_after_t0_s": round(dispatch_ts - t0, 3)}
+dispatch = time.monotonic()
+timeline = {"timeline": True, "gap_s": args.gap_s, "t0_wall": round(t0_wall, 3), "clock": "monotonic",
+            "scheduled_arrival_after_t0_s": args.gap_s, "wakeup_late_s": round(wakeup - arrival, 4),
+            "hook_wall_s": hook_wall, "hook_poll_s": HOOK_POLL_S,
+            "wait_s": round(dispatch - arrival, 3), "dispatch_after_t0_s": round(dispatch - t0, 3)}
 for i, t in enumerate(range(args.turns_a, args.turns_a + args.turns_b)):
     r = call(args.url_b, t, "B")
     if i == 0:
         r["gap_s"] = args.gap_s; r["wait_s"] = timeline["wait_s"]
-        r["arrival_to_done_s"] = round(time.time() - arrival_ts, 3)
+        r["arrival_to_done_s"] = round(time.monotonic() - arrival, 3)   # from the scheduled arrival
         timeline["first_b_arrival_to_done_s"] = r["arrival_to_done_s"]; timeline["first_b_http_latency_s"] = r["latency_s"]
     rows.append(r); print(json.dumps(r), flush=True)
 print(json.dumps(timeline), flush=True)
@@ -101,8 +109,8 @@ with open(args.out, "w") as f:
 if args.post_hook:
     # e.g. the B0 arm releases A's auto-pin here so no arm ends with a held lease
     import subprocess
-    t0 = time.time(); rc = subprocess.call(args.post_hook, shell=True)
-    print(json.dumps({"post_hook": args.post_hook, "rc": rc, "seconds": round(time.time()-t0, 3)}), flush=True)
+    t0 = time.monotonic(); rc = subprocess.call(args.post_hook, shell=True)
+    print(json.dumps({"post_hook": args.post_hook, "rc": rc, "seconds": round(time.monotonic()-t0, 3)}), flush=True)
     if rc != 0:
         with open(args.out, "a") as f:
             f.write(json.dumps({"cell_invalid": True, "reason": f"post_hook rc={rc}"}) + "\n")

@@ -364,7 +364,9 @@ A 쪽은 세 arm 모두 turn 0 = 4.21–4.26 s(cold), turn 1–2 = 0.53–0.54 s
 
 (hook = hook 자체 `total_s`, cleanup 0.11–0.20 s 포함. runner의 `hook_wall_s`는 도착 후 측정돼 `max(hook, gap)`이 되므로 쓰지 않음. A turn 0 cold 4.22–4.27 s 12셀 동일, B turn 4 GPU hit 0.53–0.55 s 12셀 동일, B 첫 턴 HTTP 지연은 B1·B2 모두 0.64–0.66 s.)
 
-**읽는 법(n=1, 관측값)**: 이득 조건 `남은 준비 대기 + restore < 재계산`. B2(CXL)는 gap 5 s에서 이미 재계산보다 짧고(3.19 < 4.30), gap 0에서는 길다(8.58 > 4.21) → crossover는 gap ≈ hook − (재계산 − restore) ≈ 7.6 − 3.65 ≈ **3.9–4.0 s**(Codex 사전 예상 3.6 s는 hook 7.0 s 기준). B1(TCP prototype)은 gap 10 s에서도 재계산의 4배(17.98) → crossover ≈ 27.1 − 3.65 ≈ **23.5 s**(예상 22.7 s), gap 35 s에서 완료. gap ≥ hook이면 두 경로는 구별되지 않는다(0.64 vs 0.66). **주장 아님**: 정책 우위나 일반적 CXL-대-네트워크 성능 주장이 아니라 경로 비용 자릿수와 WAIT 정책의 손익 경계 1점 관측. TCP prototype은 8 MiB chunk 단일 스트림. 다음 = 반복 측정(≥3), 이후 "늦은 import와 재계산 병행" 정책.
+**읽는 법(n=1, 관측값)**: 이득 조건 `남은 준비 대기 + restore < 재계산`. **직접 확인한 것**: B2(CXL)는 gap 0 s에서 손해(8.58 > 4.21), gap 5 s에서 이득(3.19 < 4.30); B1(TCP prototype)은 gap 10 s에서 손해(17.98 > 4.31), gap 35 s에서 이득(0.64). **비용식으로 추정한 경계**(gap ≈ hook − (재계산 − restore), 실측 아님): CXL 약 4 s(7.6 − 3.65), TCP 약 23.5 s(27.1 − 3.65) — Codex 사전 예상 3.6 / 22.7 s와 같은 자릿수.
+
+**계측 보정(Codex 감사, 2026-09-06)**: gap1 runner는 지표를 예정 도착(t0+gap)이 아니라 실제 wakeup부터 재서 4–35 ms가 빠졌다(`보정 지연 = arrival_to_done + arrival_after_t0_s − gap_s`; 예: gap 35 s의 B1/B2 = 0.642→0.677, 0.663→0.698). 위 표는 미보정 원값이며 결론에 영향 없음. 이후 runner(`gc_cell.py`, `2c80abbaa` 이후 수정)는 monotonic clock·예정 도착 기준·`wakeup_late_s` 별도 기록·hook 종료는 10 ms 폴링 관측으로 변경(gap2 종료 후 배포). gap1/gap2 대조는 같은 예정 도착 기준으로 보정해 개별 값·범위만 제시(p99·통계적 동등성 주장 금지). gap ≥ hook이면 두 경로는 구별되지 않는다(0.64 vs 0.66). **주장 아님**: 정책 우위나 일반적 CXL-대-네트워크 성능 주장이 아니라 경로 비용 자릿수와 WAIT 정책의 손익 경계 1점 관측. TCP prototype은 8 MiB chunk 단일 스트림. 다음 = 반복 측정(≥3), 이후 "늦은 import와 재계산 병행" 정책.
 
 **정리 순서 수정(Codex, `195e9c2e0`)**: `hook_common.cleanup_and_verify`가 B cleanup 거절 시 A cleanup을 호출하지 않고(A lock/key/payload 보존) gate 실패로 종료. 이번 12셀·이전 성공 셀은 모두 B cleanup ok였으므로 결과 무효 아님.
 

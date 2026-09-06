@@ -7,6 +7,12 @@ export CPATH="$HOME/local/usr/include:$HOME/local/usr/include/python3.10:$HOME/l
 source "$HOME/venvs/dynamo05_vllm019/bin/activate"
 export ETCD_ENDPOINTS=http://192.168.5.62:2379
 export NATS_SERVER=nats://192.168.5.62:4222
+# fixed per-worker endpoint: each worker lives in its own Dynamo namespace (NS) so a
+# frontend started with --namespace NS is a verified single-worker endpoint
+export DYN_NAMESPACE="${NS:-dynamo}"
+# vLLM derives its block-hash seed from PYTHONHASHSEED; fix it so BlockHash values
+# for the same tokens match across hosts (needed for cross-host KV import)
+export PYTHONHASHSEED=0
 export PYTHONPATH="$HOME/vamp/vamp_handoff:$HOME/vamp/probe:${PYTHONPATH:-}"
 MODEL="${MODEL:-Qwen/Qwen3-14B}"; UTIL="${UTIL:-0.90}"; MML="${MML:-16384}"; MNS="${MNS:-16}"
 CPU_GB="${CPU_GB:-64}"; TAG="${TAG:-s1}"; PORT="${PORT:-6880}"

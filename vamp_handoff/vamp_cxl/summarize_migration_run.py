@@ -96,7 +96,12 @@ def summarize_events(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     offload_reasons = Counter(d["reason"] for d in offload_decisions)
     result_reasons = Counter(t["reason"] for t in transfer_results)
 
-    external_reuse_success = result_reasons.get("PUBLISHED", 0)
+    # Only a destination import counts as external KV reuse. PUBLISHED is a
+    # source-side write into the shared tier and is reported under
+    # publication.ready; a STAY run publishes without ever reusing remotely.
+    external_reuse_success = result_reasons.get("CXL_IMPORTED", 0) + result_reasons.get(
+        "NETWORK_IMPORTED", 0
+    )
     fallbacks = {
         k: v
         for k, v in result_reasons.items()
@@ -184,6 +189,9 @@ def summarize_simulation(result: Any) -> dict[str, Any]:
             result.coordinator.executor.staging_high_watermark
         ),
         "cpu_evictions_refused_pinned": result.backend.cpu_evictions_refused,
+        # transfers that waited in the executor queue while already holding a
+        # source pin (comparison-fairness flag; expected 0 for one-at-a-time)
+        "transfers_queued_with_pin": result.coordinator.executor.queued_with_pin,
     }
     summary["accounting_at_end"] = result.coordinator.accounting()
     summary["counters"] = dict(result.coordinator.counters)

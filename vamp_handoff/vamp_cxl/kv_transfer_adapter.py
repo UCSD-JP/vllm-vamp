@@ -530,12 +530,19 @@ class TransferExecutor:
         self.staging_in_use = 0
         self.staging_high_watermark = 0
         self.queue_wait_ns: dict[JobId, int] = {}
+        # Jobs that could not start at submit time. Their source lease (pin) is
+        # already held by the coordinator, so a queued job pins KV while it
+        # waits; the demo design (one transfer at a time) expects this to be 0
+        # and the summary reports it so a cell where it is not can be flagged.
+        self.queued_with_pin = 0
 
     def submit(self, job: TransferJob) -> JobId:
         self.transport.submit(job)
         self._seq += 1
         self._queue.append((int(job.priority), self._seq, job.job_id))
         self.schedule()
+        if job.job_id not in self._running and not job.is_terminal():
+            self.queued_with_pin += 1
         return job.job_id
 
     def cancel(self, job_id: JobId) -> None:
@@ -1724,6 +1731,9 @@ class MigrationCoordinator:
                         "bytes": ev.proof.nbytes,
                     }
                 )
+                self._report(
+                    restore.prefix, None, restore.job_id, True, Reason.CXL_IMPORTED
+                )
             else:
                 self.correctness_failures.append(
                     {"kind": "checksum_mismatch", "request": restore.request.label()}
@@ -1772,6 +1782,9 @@ class MigrationCoordinator:
                     "completed_ns": ev.now_ns,
                     "bytes": ev.proof.nbytes,
                 }
+            )
+            self._report(
+                copy.prefix, None, copy.job_id, True, Reason.NETWORK_IMPORTED
             )
         else:
             self._count("network_copy_failed")

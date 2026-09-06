@@ -175,12 +175,33 @@ restore 미발생 정상(headroom, GPU eviction 없음). peak_kv_usage 0.052, wa
   해제 조건: `patches/dynamo-vamp-receipt.patch` 적용(target receipt) + per-request pinning 수단(`vamp_target_worker` 전달 경로 확인).
   G-C("실제 다른 worker 실행" 검증)도 같은 해제 조건에 걸린다.
 
+## G-C: 강제 A→B 이동, 목적지 local-cold 재계산 (2026-09-06)
+
+토폴로지(고정 endpoint): frontend A `--namespace vampA --http-port 8080` ↔ worker s1(`DYN_NAMESPACE=vampA`), frontend B `--namespace vampB --http-port 8081` ↔ worker s2(`DYN_NAMESPACE=vampB`).
+etcd `instances/vampA/backend/generate`=1, `instances/vampB/...`=1 검증. 양 worker 재기동으로 tier 초기화, `--salt gc`. receipt patch·pinning 없이 **토폴로지로 목적지 고정**.
+1 세션, turn 0–2 → A, turn 3–4 → B. prompt 12,819 tok, 순차(concurrency 1). `solab/gc_cell.py`, `solab/frontend_ns.sh`, `worker_vamp.sh`(NS, PYTHONHASHSEED=0).
+
+| turn | endpoint | latency | 해석 |
+| --- | --- | --- | --- |
+| 0 | A | 4.189 s | cold (재계산 + eager store) |
+| 1–2 | A | 0.539 / 0.533 s | GPU hit |
+| **3** | **B** | **4.175 s** | **local-cold: GPU miss + CPU tier miss → 재계산** |
+| 4 | B | 0.535 s | GPU hit (B 자체 캐시) |
+
+| worker | 요청 | GPU prefix hit | connector | READY 통지 |
+| --- | --- | --- | --- | --- |
+| s1 (A) | 3 | 25,600 / 38,457 (66.6% = 2/3) | 0 / 12,857 (turn 0 cold 조회) | 3 (801 + 1 + 1 blocks) |
+| s2 (B) | 2 | 12,800 / 25,638 (49.9% = 1/2) | **0 / 12,838 (turn 3 cold 조회)** | 2 (801 + 1) |
+
+**판정: PASS** — 목적지 local-cold(B connector 0 hit), 실제 다른 worker 실행(네임스페이스 인스턴스 1 + s2 sidecar가 2요청분), recompute 확인(4.175 s ≈ A의 cold 4.189 s). 5/5 marker 일치.
+concurrency 1이므로 4.18 s는 12.8K tok cold prefill의 **큐 대기 없는 응답 지연**이다(service time 근사치로 참고 가능; 여전히 응답 지연).
+
 ## 다른 gate
 
 | Gate | 상태 | 비고 |
 | --- | --- | --- |
 | G-B | **headroom 계측 진단 완료 / 고정 배치 미검증** | 통과 조건(카운터 해석·무오류) 충족, "worker당 4 고정" 전제 미충족. 1차 INVALID(cache 오염) → 2차 유효 |
-| G-C | NOT_RUN | receipt patch 미적용 상태에서는 "실제 다른 worker 실행" 검증 수단이 sidecar 분포뿐 |
+| G-C | **PASS** | 고정 endpoint(네임스페이스 분리)로 목적지 보장. 위 참조 |
 | G-D | NOT_RUN | scheduler↔worker RPC 미구현(in-process mailbox까지) |
 | G-E~G-G | NOT_RUN | 실제 CXL 접근 — **별도 안전 승인 전 실행 금지**(manager protocol/offset origin 미확인) |
 | G-H | NOT_RUN | |

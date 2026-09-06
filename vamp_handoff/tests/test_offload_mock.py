@@ -1011,10 +1011,20 @@ class CellSmoke(unittest.TestCase):
         self.assertEqual(
             summaries["B0_RECOMPUTE"]["migration"]["external_kv_reuse_success"], 0
         )
+        # external reuse = destination imports, never source publications
+        self.assertEqual(
+            summaries["B1_NETWORK"]["migration"]["external_kv_reuse_success"], 4
+        )
         self.assertEqual(
             summaries["B2_EAGER"]["migration"]["external_kv_reuse_success"],
-            summaries["B2_EAGER"]["publication"]["ready"],
+            summaries["B2_EAGER"]["reuse_paths"]["cxl_import"],
         )
+        self.assertGreaterEqual(
+            summaries["B2_EAGER"]["publication"]["ready"],
+            summaries["B2_EAGER"]["migration"]["external_kv_reuse_success"],
+        )
+        for name in summaries:
+            self.assertEqual(summaries[name]["capacity"]["transfers_queued_with_pin"], 0, name)
         # no implicit network fallback in CXL arms
         self.assertNotIn("network_import", summaries["P_VALUE"]["reuse_paths"])
 
@@ -1025,6 +1035,8 @@ class CellSmoke(unittest.TestCase):
         self.assertEqual(s["migration"]["designated_destination_changes"], 0)
         self.assertGreater(s["publication"]["ready"], 0)
         self.assertNotIn("cxl_import", s["reuse_paths"])
+        # publications without any remote use are not reuse successes
+        self.assertEqual(s["migration"]["external_kv_reuse_success"], 0)
 
 
 class CapabilityAudit(unittest.TestCase):

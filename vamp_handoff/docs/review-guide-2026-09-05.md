@@ -121,3 +121,14 @@ raw 결과: jpserver `asplos_paper/solab_testbed/results/ga_2026-09-05/` (17 fil
 | 보고 문구(36/36, 13배, affinity 없음) | 동의 | gate-results·solab README·메모리 문구 정정 | — |
 
 미검증으로 남는 것: 실제 CXL library에서의 fence/refresh 동작(G-E), 단일 관리자 cross-host read 경로(G-F), export lease → bridge gather → network 전송 → destination import의 end-to-end(G-D).
+
+## 7. 2차 리뷰(`42731a581` 기준, Codex 리뷰 커밋 `9897f9a`) 신규 지적 처리
+
+| 지적 | 확인 | 처리 | 검증 |
+| --- | --- | --- | --- |
+| 재사용 집계 오류: STAY도 성공으로, network import는 0으로 | **코드 확인** — `external_kv_reuse_success = PUBLISHED 수`(source-side write) | `Reason.CXL_IMPORTED`/`NETWORK_IMPORTED`를 destination import 완료 시 report; 집계는 이 둘의 합. PUBLISHED는 `publication.ready`로만 | `test_all_arms_run_and_return_to_baseline`(B1=4, B2=cxl_import), `test_stay_scenario...`(STAY=0) |
+| wrapper salt가 실제 요청을 바꾸지 않음 | **코드 확인** — `_session_body`가 seed·session_id만 사용, salt는 PrefixKey/hash chain에만 | header에 `[CELL-{salt}]` 포함 → 서버가 보는 bytes가 cell마다 다름 | 기존 M1 결정성 테스트 유지 |
+| 대기 중인 전송도 KV를 미리 pin | **코드 확인** — lease 획득 후 executor 큐 대기 가능(`_can_start` 실패 시) | 범위상(전송 한 건씩) 발생하면 안 되는 상태 → `TransferExecutor.queued_with_pin` 카운터 + summary `capacity.transfers_queued_with_pin`로 **노출·플래그**(0이 아니면 해당 cell 비교 무효). 시작 시점 pin으로의 재설계는 뒤로 | cell smoke에서 전 arm 0 assert |
+| target header/receipt로 worker 선택이 보장되지 않음 | 동의 | **네임스페이스 분리 고정 endpoint**(frontend `--namespace`, worker `DYN_NAMESPACE`)로 목적지를 토폴로지로 고정 — G-C PASS | gate-results §G-C |
+
+Codex 리뷰 문서(`full-review-42731a5.md`, `demo-feasibility-plan-2026-09-05.md`)와 bundle은 jp 로컬에만 있어 이 세션에서 읽지 못했다. 원격 push 또는 jpserver 전송 후 대조 필요.

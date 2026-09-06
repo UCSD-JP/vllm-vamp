@@ -196,11 +196,14 @@ def longest_common_prefix(sequences: list[tuple[int, ...]]) -> int:
     return n
 
 
-def _session_body(session_id: int, words: int, seed: int) -> str:
+def _session_body(session_id: int, words: int, seed: int, salt: str = "") -> str:
     rnd = random.Random((seed << 20) ^ (session_id * 7919 + 17))
+    # The cell salt must change the bytes the server sees, not only our
+    # PrefixKey: two cells with the same seed but different salts would
+    # otherwise share the server's prefix cache (cross-cell contamination).
     header = (
-        f"[SESSION-{session_id}] Repository audit log for project {session_id}. "
-        f"Nonce {rnd.randrange(1 << 30)}. Reference notes:"
+        f"[CELL-{salt}][SESSION-{session_id}] Repository audit log for project "
+        f"{session_id}. Nonce {rnd.randrange(1 << 30)}. Reference notes:"
     )
     items = [f"s{session_id}-item{i}-{rnd.randrange(100003)}" for i in range(words)]
     return header + " " + " ".join(items)
@@ -233,7 +236,7 @@ def build_session(
     lcp = 0
     turns: list[TurnSpec] = []
     for _ in range(40):
-        body = _session_body(session_id, words, cfg.seed)
+        body = _session_body(session_id, words, cfg.seed, cfg.salt)
         turns = []
         for turn_id in range(cfg.turns_per_session):
             messages = _build_turn_messages(body, session_id, turn_id)

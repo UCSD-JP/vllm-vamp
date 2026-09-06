@@ -87,6 +87,10 @@ class Reason(str, Enum):
     IMPORT_FAILED = "IMPORT_FAILED"
     NETWORK_COPY_FAILED = "NETWORK_COPY_FAILED"
     CHECKSUM_MISMATCH = "CHECKSUM_MISMATCH"
+    # destination actually imported the KV (the only events that count as
+    # external reuse success; PUBLISHED is a source-side write, not a reuse)
+    CXL_IMPORTED = "CXL_IMPORTED"
+    NETWORK_IMPORTED = "NETWORK_IMPORTED"
 
 
 class StateChangeKind(str, Enum):

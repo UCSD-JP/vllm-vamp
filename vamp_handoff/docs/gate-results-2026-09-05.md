@@ -388,6 +388,15 @@ A 쪽은 세 arm 모두 turn 0 = 4.21–4.26 s(cold), turn 1–2 = 0.53–0.54 s
 
 ## 다른 gate
 
+**2026-09-06 D3 follow-up (Codex)**: actual GPU KV -> registered shared CXL ->
+B GPU KV import/reuse **PASS**, with bounded 127.5 MiB staging. Large matched
+cell: 13,819 prompt tokens, 861 blocks / 2,257,059,840 B, GPU hits 13,776 tokens,
+CPU external hits 0. B response 0.563 s vs B0 4.579 s; however full-verification
+gap=0 arrival-to-done is 9.670 s vs B0 4.718 s. Checksum-abort and B->A cleanup
+PASS. Not routing/pressure evidence. See [D3 results](d3-results-2026-09-06.md)
+and [implementation scope/spec](d3-direct-kv-spec.md). Earlier D3-not-done
+statements above describe the earlier gates, not the current status.
+
 | Gate | 상태 | 비고 |
 | --- | --- | --- |
 | D0–D2 직접 경로 | **PASS** | 등록 ok(flag 0), 2 GiB GPU→CXL 7.3 GB/s / CXL→GPU 10.7 GB/s, cross-host 바이트 일치. D3(실 KV) 미완 |

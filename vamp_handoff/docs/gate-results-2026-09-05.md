@@ -372,10 +372,25 @@ A 쪽은 세 arm 모두 turn 0 = 4.21–4.26 s(cold), turn 1–2 = 0.53–0.54 s
 
 **정리 순서 수정(Codex, `195e9c2e0`)**: `hook_common.cleanup_and_verify`가 B cleanup 거절 시 A cleanup을 호출하지 않고(A lock/key/payload 보존) gate 실패로 종료. 이번 12셀·이전 성공 셀은 모두 B cleanup ok였으므로 결과 무효 아님.
 
+## D0–D2: GPU ↔ CXL 직접 경로 feasibility (2026-09-06, `solab/cxl_dma_probe.py`) — **PASS**
+
+우선순위 변경(Codex/jp): DRAM 경유 비용으로 정책을 정교화하기 전에 직접 경로 가능 여부를 확인. gap2는 6셀(gap 0·5 × 3 arm) 완료 상태로 보존·중단(값은 gap1과 근접: B2 8.51/3.30, B1 27.80/23.64, B0 4.2–4.3). 양 worker 정지, manager 유지, **독립 프로세스**(provider 호출은 메인 스레드 1개), payload는 provider `shm_payload_alloc`으로 우리 슬라이스 안에서만 할당. writer = s1(node 1, GPU A), reader = s2(node 0, GPU B). 복사 시간과 sha256(correctness)은 분리 측정.
+
+| 단계 | 결과 |
+| --- | --- |
+| D0 등록 | host 대조군 64 MiB: `cudaHostRegister(flag 0)` ok. **CXL payload(devdax mmap) 256 MiB·2 GiB: flag 0(Default)로 ok**(6 ms). IoMemory/Mapped는 시도 불필요. driver 550.54.14 / CUDA 12.8 runtime(torch) / RTX A6000 / kernel 6.6.0-rc6 조합 |
+| D1 A GPU→CXL | 256 MiB 7.47 GB/s; **2 GiB 0.295 s = 7.28 GB/s**(2회 동일), 이후 clwb fence 0.159 s, 로컬 sha256 일치 |
+| D1 CXL→B GPU | 256 MiB 10.69 GB/s; **2 GiB 0.201 s = 10.7 GB/s**(2회 동일), 사전 clflush refresh 0.160 s |
+| D2 cross-host | A GPU → 공유 CXL → B GPU: lock+레코드+fence/refresh 규약 하에 **GPU 바이트 sha256 일치, CPU view 일치**(256 MiB 1회, 2 GiB 2회) |
+| 대조 | 같은 GPU ↔ 일반 pinned DRAM 2 GiB: D2H 26.1 / H2D 25.1 GB/s. GPU 링크 = PCIe **Gen4 x16**(b8:00.0 max 16 GT/s). CXL 장치 = a8:00.0 class 0x050210, vendor 0x1c5c(**SK hynix**) |
+
+**읽는 법**: 직접 경로는 이 구성에서 동작한다(등록·복사·cross-host 가시성·바이트 일치). 10.7 / 7.3 GB/s는 GPU PCIe 한계(25 GB/s 실측)가 아니라 **CXL Type-3 장치 경로의 실효 처리량**이며, 단일 스레드 CPU 읽기(약 3 GB/s)보다 3.5배 높다. 이는 **DRAM-staged 경로의 CXL 구간(write 0.23+fence 0.16+refresh 0.16+CXL→DRAM 0.69 s)과 DRAM→GPU restore를 GPU DMA 0.30+0.20 s로 대체할 수 있다**는 뜻이지만, **D3(실제 KV 블록을 vLLM GPU KV 텐서에서 직접 CXL로 내보내고 B의 GPU KV 블록으로 들여와 재사용·정답 확인)은 미완**이다. 현재 agent는 CPU tier에서 gather하므로 자동으로 직접 경로가 되지 않는다. 기존 gap1/gap2·B0/B1/B2 결과는 **DRAM-staged 기준선**으로 보존.
+
 ## 다른 gate
 
 | Gate | 상태 | 비고 |
 | --- | --- | --- |
+| D0–D2 직접 경로 | **PASS** | 등록 ok(flag 0), 2 GiB GPU→CXL 7.3 GB/s / CXL→GPU 10.7 GB/s, cross-host 바이트 일치. D3(실 KV) 미완 |
 | Gap `gap1` | **완료(n=1, 12셀)** | 도착→완료: B0 4.2–4.3 s 상수; B2 8.58/3.19/0.65/0.66; B1 27.84/22.70/17.98/0.64 (gap 0/5/10/35). 위 참조 |
 | B0/B1/B2 | **완료(n=1)** | 동일 입력·cold reset·strict gate. B 첫 턴 4.28 / 0.64 / 0.65 s, 준비 비용 – / 26.0 / 7.0 s. 위 참조 |
 | 실패 주입·정리 | **PASS** | wrong_key / checksum 둘 다 `CLEANUP_GATE ok`, 실패 전파 확인. 위 참조 |

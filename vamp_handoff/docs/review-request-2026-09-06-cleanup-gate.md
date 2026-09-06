@@ -58,6 +58,13 @@
 - 3차 리뷰(2c80abbaa) 반영: 지표를 예정 도착(t0+gap) 기준으로, 시계를 monotonic으로, wakeup 지연을 별도 기록(`wakeup_late_s`), hook 종료 10 ms 폴링 명시. gap1 값은 timeline 보정으로 처리(재실행 불필요). 3회차는 12셀 반복 대신 gap 4 s·24 s 주변 대조 + arm 순서 교체.
 - 알려진 계측 아티팩트: runner `hook_wall_s`는 도착 후 측정 → `max(hook, gap)`; hook 실제 소요는 hook `total_s`. 다음 반복 측정 전에 runner가 hook 종료 시각을 폴링으로 직접 기록하도록 고칠 예정.
 
+## 3d. 우선순위 변경 → D0–D2 결과 (2026-09-06)
+
+- gap2: 6셀(gap 0·5) 완료 후 루프 중단, 결과 보존(`~/vamp/ga/gap2_*`). worker 정지, manager 유지(pid 232614).
+- D0–D2 PASS: gate-results "D0–D2" 참조. 판정 문구는 지시대로 "이 구성(driver 550.54.14/CUDA 12.8 runtime/A6000/kernel 6.6.0-rc6/devdax mmap/flag 0)에서 등록·복사·cross-host 일치 확인"으로 한정.
+- 10.7/7.3 GB/s 원인: GPU PCIe Gen4 x16(대조 25–26 GB/s)이 아니라 CXL 장치 경로. 장치 = SK hynix CXL memory device(a8:00.0).
+- 미해결: D3(실 KV 블록 직접 경로 export/import + B 재사용·정답), 그 뒤 정책이 쓸 비용/행동 확정. checksum ablation(`verify=none`, B1과 검증 범위 정합)은 D3 이후 gap=0 3셀로.
+
 ## 4. 부수 사항
 
 - 표현 정정 반영: agent 주석 "zero-copy view" → "CXL 매핑 view, `import_payload`가 CPU tier로 복사".
